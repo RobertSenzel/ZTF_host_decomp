@@ -11,6 +11,7 @@ from astropy.wcs import WCS
 from astropy import units as u
 from astropy.table import Table
 import matplotlib.pyplot as plt
+from scipy.integrate import quad
 from skimage import measure, draw
 from scipy.signal import convolve2d
 from astroquery.ipac.ned import Ned
@@ -18,28 +19,33 @@ from astroquery.vizier import Vizier
 from astropy.cosmology import Planck18
 from matplotlib.patches import Ellipse
 from scipy.interpolate import interp1d
+from scipy.odr import Model, Data, ODR
 from skimage.measure import EllipseModel
 from astropy.coordinates import SkyCoord
 from scipy.ndimage import gaussian_filter
 from scipy.special import gamma, gammainc
-from scipy.optimize import curve_fit, fsolve
+from scipy.optimize import curve_fit, fsolve, minimize
+from matplotlib.colors import ListedColormap
 from skimage.measure import label as ConnectRegion
 from astroquery.exceptions import RemoteServiceError
-from scipy.odr import Model, Data, ODR
+from astropy.convolution import convolve_fft, Gaussian2DKernel
 
 sample = ztfidr.get_sample()
 host_data = ztfidr.io.get_host_data()
 Vizier.ROW_LIMIT = 1000
 qs = Vizier.get_catalogs('J/ApJS/196/11/table2')
 df_update = pd.read_csv('csv_files/ztfdr2_matched_hosts.csv', index_col=0)
+df10 = Table.read('fits_files/survey-bricks-dr10-south.fits.gz', format='fits')
+df9 = Table.read('fits_files/survey-bricks-dr9-north.fits.gz', format='fits')
+
 
 class HostGal:
     def __init__(self, verbose):
         self.verbose = verbose
         self.cutout = {}
-        self.iso = {} 
         self.gal = {}
-        self.survey = 'None'
+        self.brick = {}
+        self.survey = 'legacy'
  
 
     def init_query(self, host_name, catalog):
@@ -216,7 +222,7 @@ class HostGal:
         # print(self.gal['type'], self.gal['t'], self.gal['incl'], self.gal['source'] ) if self.verbose else None
     
     
-    def flux2mag(self, flux, survey, band, scale, soft, exptime=1, extinction=True):
+    def flux2mag(self, flux, survey, band, scale, soft, exptime=1):
         # ztf_filters = {'g': 4746.48, 'r': 6366.38, 'i': 7829.03}
         ps1_filters = {'g': 4810.16 , 'r': 6155.47, 'i': 7503.03, 'z': 8668.36, 'y': 9613.60}
         sdss_filters = {'g': 4671.78, 'r': 6141.12, 'i': 7457.89, 'z': 8922.78, 'u': 3608.04}
@@ -233,6 +239,9 @@ class HostGal:
             return zp - 2.5*np.log10(flux/scale**2) - A_
         
         zp_ = {'legacy': 22.5, 'sdss': 22.5, 'ps1': 25 + 2.5*np.log10(exptime)}
+        self.brick['sky_mag'] = float(mag_soft(self.brick['sky'], zp_[survey]))
+
+        flux = flux - self.brick['sky']
         return mag_soft(flux, zp_[survey]) if soft else mag_(flux, zp_[survey])
 
     
@@ -259,14 +268,10 @@ class HostGal:
         elif source == 'save':
             fits_ = fits.open(path)
             fits_data = fits_
-            self.survey = fits_data[1].header['survey']
-            output_size = fits_data[1].header['output_size']
         elif source == 'query_save':
             output_size = self.calc_aperature(output_, self.gal['z'], scale)
             fits_ = self.get_cutout(survey, output_size, band, scale)
             fits_data = fits_
-            fits_data[1].header['survey'] = self.survey
-            fits_data[1].header['output_size'] = output_size
             fits_data.writeto(path, overwrite=True)
             fits_.close()
             return
@@ -274,15 +279,25 @@ class HostGal:
             print('invalid source')
             return
 
-        print(self.survey, output_size, scale) if self.verbose else None
+        
         flux, invvar, wcs = fits_data[1].data, fits_data[2].data, WCS(fits_data[1].header)
+        brick_name = fits_data[1].header['brick']
+        brick_data = {'dr10': df10[df10['brickname'] == brick_name], 'dr9': df9[df9['brickname'] == brick_name]}
+        brick_dr = 'dr10' if len(brick_data['dr10']) == 1 else 'dr9'
+        df_brick = brick_data[brick_dr]
+        
+        self.brick = {'brickname': brick_name, 'psfsize': df_brick[f'psfsize_{band}'][0], 'psfdepth': df_brick[f'psfdepth_{band}'][0], 'galdepth': df_brick[f'galdepth_{band}'][0],
+                      'sky': df_brick[f'cosky_{band}'][0]}
+
         exptime = fits_data.header['exptime'] if self.survey == 'ps1' else 1
         mag = self.flux2mag(flux, self.survey, band, scale, soft, exptime=exptime)
         mag_raw = self.flux2mag(flux, self.survey, band, scale, soft=False, exptime=exptime)
-        self.cutout = {'flux': flux, 'mag': mag, 'mag_raw': mag_raw, 'invvar': invvar, 'wcs': wcs, 'scale': scale}
+        self.cutout = {'flux': flux, 'mag': mag, 'mag_raw': mag_raw, 'invvar': invvar, 'wcs': wcs, 'scale': scale, 'band': band}
+        
+        print(brick_dr, *mag.shape) if self.verbose else None
         fits_.close()
 
-
+        
     def plot(self):
         wcs, mag, scale = self.cutout['wcs'], self.cutout['mag'], self.cutout['scale']
         (sn_ra, sn_dec) = self.gal['sn']
@@ -291,7 +306,7 @@ class HostGal:
         map_ = ax.imshow(mag, cmap='gray')
         c = SkyCoord(ra=sn_ra*u.degree, dec=sn_dec*u.degree, frame='icrs')
         sn_px = wcs.world_to_pixel(c)
-        ax.scatter(sn_px[0], sn_px[1], c='cyan', s=40, lw=2, fc='None', ec='cyan')
+        ax.scatter(sn_px[0], sn_px[1], c='cyan', s=40, lw=2, fc='None', ec='cyan', zorder=10)
 
         fig.colorbar(map_, ax=ax, label=r'mag arcsec$^{-2}$')
         ax.set_ylabel('Declination')
@@ -304,36 +319,48 @@ class HostGal:
 
 
 class galaxy_decomp:
-    def __init__(self, target_name, verbose, mask, band, source,  size='z', catalog='ztf'):
+    def __init__(self, target_name, verbose, mask, source, size='z', catalog='ztf'):
         self.verbose = verbose
-        self.gobj = HostGal(verbose=verbose)
+        self.gobj = {'g': HostGal(verbose=verbose), 'r': HostGal(verbose=verbose)}
         if catalog == 'ztf':
-            self.gobj.init_dr2(target_name)
+            self.gobj['g'].init_dr2(target_name)
+            self.gobj['r'].init_dr2(target_name)
         else:
-            self.gobj.init_query(target_name, catalog)
-        self.gobj.get_image(source=source, survey='auto', output_=size, band=band, scale=0.262)
+            self.gobj['g'].init_query(target_name, catalog)
+            self.gobj['r'].init_query(target_name, catalog)
+        self.gobj['g'].get_image(source=source, survey='auto', output_=size, band='g', scale=0.262)
+        self.gobj['r'].get_image(source=source, survey='auto', output_=size, band='r', scale=0.262)
 
-        self.contours = {}
-        self.image = self.gobj.cutout['mag']
-        self.invvar = self.gobj.cutout['invvar']    
-        self.flux = self.gobj.cutout['flux']
-        self.mask, self.center = self.generate_masks() if mask else ([], np.array(self.image.shape)//2)
+        self.contours = {'g': {}, 'r': {}}
+        self.image = {'g': self.gobj['g'].cutout['mag'], 'r': self.gobj['r'].cutout['mag']}
+        self.invvar = {'g': self.gobj['g'].cutout['invvar'], 'r': self.gobj['r'].cutout['invvar']} 
+        self.flux = {'g': self.gobj['g'].cutout['flux'], 'r': self.gobj['r'].cutout['flux']} 
+        self.mask = mask
+        self.center =  np.array(self.image.shape)//2
 
-    def plot_fit(self, isophotes, width=0.5, apply_mask=False, zoom=False):
+    def plot_fit(self, isophotes, band, width=0.1, mask=False, zoom=False):
         fig, (ax1, ax2) = plt.subplots(figsize=(12, 6), dpi=100, ncols=2)
-        mag, wcs = self.image, self.gobj.cutout['wcs']
+        mag, wcs = self.image[band], self.gobj[band].cutout['wcs']
         ax2.imshow(mag, cmap='gray', origin='lower')
 
-        (sn_ra, sn_dec) = self.gobj.gal['sn']
+        (sn_ra, sn_dec) = self.gobj[band].gal['sn']
         c = SkyCoord(ra=sn_ra*u.degree, dec=sn_dec*u.degree, frame='icrs')
         sn_px = wcs.world_to_pixel(c)
         ax2.scatter(sn_px[0], sn_px[1], c='cyan', s=40, lw=2, fc='None', ec='cyan')
+
+        if np.any(mask):
+            for (ra, dec, r, c) in mask:
+                coords = SkyCoord(ra=ra*u.degree, dec=dec*u.degree, frame='icrs')
+                m_px = wcs.world_to_pixel(coords)
+                radius = r*(c*-0.5+1)
+                m_patch = Ellipse((m_px[0], m_px[1]), 2*radius, 2*radius, 0, edgecolor='black', facecolor='black', zorder=10, alpha=0.5)
+                ax1.add_patch(m_patch)
   
-        targets = self.contours.keys() if isophotes == 'all' else isophotes
+        targets = self.contours[band].keys() if isophotes == 'all' else isophotes
         for i, iso_i in enumerate(targets):
-            params, px_data = self.contours[iso_i]
+            params, px_data = self.contours[band][iso_i]
             a, b, theta, n, xc, yc, *err = params
-            px_all, px_fit = px_data
+            px_all, px_fit, window = px_data
 
             norm = np.stack(np.where((mag.T > iso_i-width) & (mag.T < iso_i+width))).T
             ax2.scatter(norm.T[0], norm.T[1], s=2, marker='o', zorder=0, color='red', label=f'{iso_i:.1f} $\pm$ {width}')
@@ -360,15 +387,14 @@ class galaxy_decomp:
         plt.tight_layout()
         return ax1, ax2
         
-    def prep_pixels(self, isophote, blur, window):
+    def prep_pixels(self, isophote, window, band):
         kernal3 = np.array([[ 0,  1,  1],
                             [ -1,  0,  1],
                             [-1,  -1,  0,]])
 
         kernal_ = 1/(kernal3 + isophote)
         kernal_unit = kernal_ / np.sum(kernal_)
-        conv_blur = gaussian_filter(self.image, sigma=blur)
-        convolve_1 = convolve2d(conv_blur, kernal_unit, mode='same')
+        convolve_1 = convolve2d(self.image[band], kernal_unit, mode='same')
         convolve_2 = convolve2d(convolve_1, kernal_unit[::-1], mode='same')
 
         convolve_2[:5,:] = 0
@@ -382,22 +408,15 @@ class galaxy_decomp:
     @staticmethod
     def super_ellipse(phi, a_, b_, pa, n, polar=True):
         a, b = max(a_, b_), min(a_, b_)
-        def super_transform(phi):
-            return np.arctan((a/b)**(n/2) * np.abs(np.tan(phi))**(n/2) * np.sign(np.tan(phi)))
-
-        theta = super_transform(phi-pa)
-        x_ = a*np.abs(np.cos(theta))**(2/n)*np.sign(np.cos(theta))  
-        y_ = b*np.abs(np.sin(theta))**(2/n)*np.sign(np.sin(theta)) 
-
-        x = x_*np.cos(pa) - y_*np.sin(pa)
-        y = x_*np.sin(pa) + y_*np.cos(pa)
-
+        r = (np.abs(np.cos(phi-pa)/a)**n + np.abs(np.sin(phi-pa)/b)**n ) **(-1/n)
         if polar:
-            return np.sqrt(x**2 +  y**2)
+            return r
         else:
+            x = r*np.cos(phi)
+            y = r*np.sin(phi)
             return x, y
 
-    def super_ellipse_fitter(self, data, err, fix_center=True):
+    def super_ellipse_fitter(self, data, err):
         ell = EllipseModel()
         ell.estimate(data)
         if ell.params is None:
@@ -419,7 +438,7 @@ class galaxy_decomp:
         ax.plot(xse_t, yse_t, 'r-', color=color, zorder=10, label=label)
         ax.plot(xse_t[[0, -1]], yse_t[[0, -1]], 'r-', color=color, zorder=10)
 
-    def extract_regions(self, contour):
+    def extract_regions(self, contour, mask):
         def get_pixels(region, connect): return np.stack(np.where(connect == region))
 
         binary_image = np.zeros_like(self.image, dtype=np.uint8)
@@ -427,62 +446,86 @@ class galaxy_decomp:
         connect_ = ConnectRegion(binary_image, connectivity=2, background=0)
         region_count = np.asarray(np.unique(connect_, return_counts=True)).T[1:].T
         galaxy_region = max(region_count.T, key=lambda x: x[1])[0]
+
+        if np.any(mask):
+            for (ra, dec, r, c) in mask:
+                coords = SkyCoord(ra=ra*u.degree, dec=dec*u.degree, frame='icrs')
+                m_px = self.gobj.cutout['wcs'].world_to_pixel(coords)
+                radius = r*(c*-0.5+1)
+                ell_px = draw.ellipse(m_px[0], m_px[1], radius, radius, rotation=0)
+                mask = np.ones_like(self.image)
+                px_cutoff = (ell_px[0] < self.image.shape[0]) & (ell_px[1] < self.image.shape[0])
+                mask[ell_px[0][px_cutoff], ell_px[1][px_cutoff]] = 0
+                connect_ = connect_ * mask
+
         return get_pixels(galaxy_region, connect_).T         
            
-    def contour_fit(self, isophote, window, mask, blur=0):
-        all_pixels  = self.prep_pixels(isophote, blur=blur, window=window)
-        connect_all = self.extract_regions(all_pixels)
+    def contour_fit(self, isophote, mask, band):
+        
+        def fit_px(window, return_err):
+            all_pixels = self.prep_pixels(isophote, window, band)
+            try:
+                connect_all = self.extract_regions(all_pixels, mask)
+                fit_vals = self.image[band].T[connect_all.T[0], connect_all.T[1]]
+                fit_invvar = var_frac.T[connect_all.T[0], connect_all.T[1]]
+                cuts = (fit_vals > isophote-window) & (fit_vals < isophote+window)
+                connect_all, fit_vals, fit_invvar = connect_all[cuts], fit_vals[cuts], fit_invvar[cuts]
+                if len(connect_all) < 25:
+                    raise ValueError
 
-        if len(connect_all) > 25:
-            
-            # var_mag = -2.5*np.log10(np.sqrt(1/self.invvar)/0.262**2)
-            var_frac = np.abs(-2.5/np.log(10)*np.sqrt(1/self.invvar)/self.flux)
+                def linear(x, a, b): return a*x + b
+                slope_corr = curve_fit(linear, fit_vals, fit_invvar)
 
-            fit_vals = self.image.T[connect_all.T[0], connect_all.T[1]]
-            fit_invvar = var_frac.T[connect_all.T[0], connect_all.T[1]]
-            cuts = (fit_vals > isophote-window) & (fit_vals < isophote+window)
-            connect_all, fit_vals, fit_invvar = connect_all[cuts], fit_vals[cuts], fit_invvar[cuts]
+                px_uncertainity =  fit_invvar/linear(fit_vals, *slope_corr[0])
+                pars, pars_err, center = self.super_ellipse_fitter(connect_all, px_uncertainity)
+            except (RuntimeError, ValueError):
+                if return_err:
+                    return 1
+                else:
+                    return [[0,0,0,0,0,0,0,0,0,0,0,0], [[], [], window]]
+            else:
+                if return_err:
+                    return np.sum((pars_err/pars)**2)
+                else:
+                    return [[*pars, *center, *pars_err, fit_invvar.mean(), fit_vals.mean()], [all_pixels, connect_all, window]]
 
-            def linear(x, a, b): return a*x + b
-            slope_corr = curve_fit(linear, fit_vals, fit_invvar)
-            # (np.abs(fit_vals-isophote))**(1/3) *
-            #
-            px_uncertainity =  fit_invvar/linear(fit_vals, *slope_corr[0])
-            pars, pars_err, center = self.super_ellipse_fitter(connect_all, px_uncertainity)
-
-            self.contours[isophote] = [[*pars, *center, *pars_err, fit_invvar.mean(), fit_vals.mean()], [all_pixels, connect_all]]
-            
-        else:
-            self.contours[isophote] = [[0,0,0,0,0,0,0,0,0,0,0,0], [[], []]]
+        var_frac = np.abs(-2.5/np.log(10)*np.sqrt(1/self.invvar[band])/self.flux[band])
+        result = minimize(fit_px, 0.2, args=(True), bounds=[(0.1, 0.5)], method='Powell', tol=0.1)
+        self.contours[band][isophote] = fit_px(result.x, return_err=False)
 
     def main_run(self):
         step = 0.2
-        for iso in np.arange(24.6, 16, -step):
-            iso = np.round(iso, 1)
-            print(iso) if (iso%1==0.0 and self.verbose) else None
-            self.contour_fit(iso, 0.25, mask=True)
-            if len(self.contours[iso][1][1]) == 0:
-                del self.contours[iso]
-                break
+        for band in ['g', 'r']:
+            for iso in np.arange(25, 16, -step):
+                iso = np.round(iso, 1)
+                print(f'{band}-{iso}') if (iso%1==0.0 and self.verbose) else None
+                self.contour_fit(iso, mask=[], band=band)
+                if len(self.contours[band][iso][1][1]) == 0:
+                    del self.contours[band][iso]
+                    break
+        
+
 
 
 class BDdecomp:
-    def __init__(self, host_name, gd, remove=None):
+    def __init__(self, host_name, gd):
         self.host_name = host_name
         self.contours = gd.contours
         self.image = gd.image
         self.invvar = gd.invvar
-        self.gal = {'center': gd.center}
+        self.center = gd.center
+        self.gobj = gd.gobj
         self.mask = gd.mask
-        (self.mags, self.iso_data) = self.extract_data(remove)
-        self.error_sc = self.scale_error()(self.mags)
+        mags_g, iso_data_g = self.extract_data('g')
+        mags_r, iso_data_r = self.extract_data('r')
+        self.mags = {'g': mags_g, 'r': mags_r}
+        self.iso_data = {'g': iso_data_g, 'r': iso_data_r}
 
-    def extract_data(self, remove):
-        key_targs = list(self.contours.keys())[slice(remove)]
-        mags = np.array(key_targs)
-        pars_ = np.array([self.contours[iso_key][0] for iso_key in key_targs if len(self.contours[iso_key][0]) > 0]).T
+    def extract_data(self, band):
+        key_targs = list(self.contours[band].keys())
+        pars_ = np.array([self.contours[band][iso_key][0] for iso_key in key_targs if len(self.contours[band][iso_key][0]) > 0]).T
         
-        offsets = np.sqrt((pars_[4]-self.gal['center'][0])**2 + (pars_[5]-self.gal['center'][1])**2)
+        offsets = np.sqrt((pars_[4]-self.center[0])**2 + (pars_[5]-self.center[1])**2)
         cuts = np.where((offsets < 5))
 
         mags = np.array(key_targs)[cuts]
@@ -493,34 +536,27 @@ class BDdecomp:
     
     @staticmethod
     def super_ellipse(phi, a_, b_, pa, n, polar=True):
-        a, b = max(a_, b_), min(a_, b_)
-        def super_transform(phi):
-            return np.arctan((a/b)**(n/2) * np.abs(np.tan(phi))**(n/2) * np.sign(np.tan(phi)))
-
-        theta = super_transform(phi-pa)
-        x_ = a*np.abs(np.cos(theta))**(2/n)*np.sign(np.cos(theta))  
-        y_ = b*np.abs(np.sin(theta))**(2/n)*np.sign(np.sin(theta)) 
-
-        x = x_*np.cos(pa) - y_*np.sin(pa)
-        y = x_*np.sin(pa) + y_*np.cos(pa)
-
+        a, b = max(abs(a_), abs(b_)), min(abs(a_), abs(b_))
+        r = (np.abs(np.cos(phi-pa)/a)**n + np.abs(np.sin(phi-pa)/b)**n )**(-1/n)
         if polar:
-            return np.sqrt(x**2 +  y**2)
+            return r
         else:
+            x = r*np.cos(phi)
+            y = r*np.sin(phi)
             return x, y
 
-    def patch_super_ellipse(self, pars, center, ax, color):
+    def patch_super_ellipse(self, pars, center, ax, color, label=None):
         t_r = np.arange(-np.pi/2, np.pi/2, 0.01)+ pars[2]
         xse, yse = self.super_ellipse(t_r, *pars, polar=False) 
         xse_t = np.concatenate([xse, -xse])+ center[0]
         yse_t = np.concatenate([yse, -yse])+ center[1]
-        ax.plot(xse_t, yse_t, 'r-', color=color, zorder=10)
+        ax.plot(xse_t, yse_t, 'r-', color=color, zorder=6, label=label)
         ax.plot(xse_t[[0, -1]], yse_t[[0, -1]], 'r-', color=color, zorder=10)
     
-    def plot_iso(self):
-        pars_ = self.iso_data
-        fig, ax = plt.subplots(figsize=(14, 8), ncols=2, nrows=2, dpi=100)
-        ax1, ax2, ax3, ax4 = ax.flatten()
+    def plot_iso(self, band):
+        pars_ = self.iso_data[band]
+        fig, ax = plt.subplots(figsize=(12, 10), ncols=2, nrows=3, dpi=100)
+        ax1, ax2, ax3, ax4, ax5, ax6 = ax.flatten()
 
         ecc = 1-pars_[1]/pars_[0]
         ax1.plot(pars_[0]*0.262, ecc, 'r.')
@@ -538,14 +574,16 @@ class BDdecomp:
         ax3.set_xlabel('R [arcsec]')
         ax3.set_ylabel('Position angle [deg]')
 
-        ax4.plot(pars_[0]*0.262, pars_[6]*0.262, 'b.', label='fit_err')
-        ax4.plot(pars_[0]*0.262, pars_[10], 'r.', label='mag_err')
-        xerr = self.iso_data[6]*0.262
-        mag_err = self.iso_data[10] 
-        yerr = mag_err + xerr
-        ax4.plot(pars_[0]*0.262, yerr, 'g.', label='summed err')
+        ax4.plot(pars_[0]*0.262, np.sqrt(pars_[6]*pars_[7])*0.262, 'b.', label='fit error')
+        ax4.plot(pars_[0]*0.262, pars_[10], 'r.', label='mag error')
+        # ax4.plot(pars_[0]*0.262, pars_[6]/pars_[0], 'g.', label='fractional fit error', c='lime')
         ax4.legend()
         ax4.set_xlabel('R [arcsec]')
+
+        ax5.plot(pars_[0]*0.262, pars_[3], 'b.')
+        ax5.set_ylim([0, 5])
+        ax5.set_xlabel('R [arcsec]')
+        ax5.set_ylabel('Super ellipse n')
 
         plt.tight_layout()
         return fig, ax
@@ -563,24 +601,15 @@ class BDdecomp:
         b = np.vectorize(self.get_b)(n)
         return ue - 2.5*b/np.log(10), Re/b**n
 
-    def B_D(self, ue, u0, Re, h, n):
-        Ie = 10**(-0.4*ue)
-        I0 = 10**(-0.4*u0)
-        b = np.vectorize(self.get_b)(n)
-        return n*gamma(2*n)*np.exp(b)/b**(2*n) * (Re/h)**2 * (Ie/I0)
-
-    def B_T(self, ue, u0, Re, h, n):
-        bd = self.B_D(ue, u0, Re, h, n)
-        return 1/(1/bd + 1)
-
     @staticmethod
     def bulge(x, ue, Re, n):
-        b = np.vectorize(BDdecomp.get_b)(n)
-        return ue + 2.5*b/np.log(10) * ((x/Re)**(1/n) - 1)
+        # b = np.vectorize(BDdecomp.get_b)(n)
+        b = 1.9992*n - 0.3271
+        return ue + 2.5*b/np.log(10) * ((np.abs(x)/Re)**(1/n) - 1)
     
     @staticmethod
     def disk(x, u0, h):
-        return u0 + 2.5/np.log(10)*(x/h)
+        return u0 + 2.5/np.log(10)*(np.abs(x)/h)
 
     @staticmethod
     def add_mag(m1, m2):
@@ -589,141 +618,393 @@ class BDdecomp:
     @staticmethod
     def combine(x, ue, u0, Re, h, n):
         return BDdecomp.add_mag(BDdecomp.bulge(x, ue, Re, n), BDdecomp.disk(x, u0, h))
+    
+    @staticmethod
+    def combine_3(x, ue_bulge, ue_bar, u0, Re_bulge, Re_bar, h, n_bulge, n_bar):
+        bar_bulge = BDdecomp.add_mag(BDdecomp.bulge(x, ue_bulge, Re_bulge, n_bulge), BDdecomp.bulge(x, ue_bar, Re_bar, n_bar))
+        return BDdecomp.add_mag(bar_bulge, BDdecomp.disk(x, u0, h))
+    
+    @staticmethod
+    def psf(r):
+        sigma = 1.7104517/(2*np.sqrt(2*np.log(2))) # self.gobj[band].brick['psfsize']
+        return 1/(sigma*np.sqrt(2*np.pi))*np.exp(-(1/2)*(r/sigma)**2)
 
     @staticmethod
-    def combine_2d(pars, x):
-        ue, u0, Re, h, n = pars
-        # if (u0<18) | (u0>23):
-        #     ue *= (1-np.abs(ue-u0)**2)
-        return BDdecomp.add_mag(BDdecomp.bulge(x, ue, Re, n), BDdecomp.disk(x, u0, h))
+    @np.vectorize
+    def convolve_psf1(r, model):
+        def integrand(x):
+            return model(x)*BDdecomp.psf(r-x)
+        integral = quad(integrand, -np.inf, np.inf)
+        if integral[0] < integral[1]:
+            return model(r)
+        else:
+            return integral[0]
+    
+    @staticmethod
+    def convolve_psf(r, model):
+        r_test = np.linspace(-50, 50, 1000)
+        psf_conv = convolve_fft(model(r_test), BDdecomp.psf(r_test))
+        return interp1d(r_test, psf_conv)(r)
+    
+    @staticmethod
+    def one_component(r, ue, Re, n):
+        model_flux = lambda x: 10**(-0.4*BDdecomp.bulge(x, 0, Re, n))
+        return -2.5*np.log10(10**(-0.4*ue)*BDdecomp.convolve_psf(r, model_flux))
+    
+    @staticmethod
+    def one_component_disk(r, u0, h):
+        model_flux = lambda x: 10**(-0.4*BDdecomp.disk(x, 0, h))
+        return -2.5*np.log10(10**(-0.4*u0)*BDdecomp.convolve_psf(r, model_flux))
+    
+    @staticmethod
+    def two_component(r, ue, u0, Re, h, n):
+        model_flux_1 = lambda x: 10**(-0.4*BDdecomp.bulge(x, 0, Re, n))
+        model_flux_2 = lambda x: 10**(-0.4*BDdecomp.disk(x, 0, h))
+        return -2.5*np.log10(10**(-0.4*ue)*BDdecomp.convolve_psf(r, model_flux_1) + 10**(-0.4*u0)*BDdecomp.convolve_psf(r, model_flux_2))
+    
+    @staticmethod
+    def three_component(r, ue_bulge, ue_bar, u0, Re_bulge, Re_bar, h, n_bulge, n_bar):
+        model_flux_1 = lambda x: 10**(-0.4*BDdecomp.bulge(x, 0, Re_bulge, n_bulge))
+        model_flux_2 = lambda x: 10**(-0.4*BDdecomp.disk(x, 0, h))
+        model_flux_3 = lambda x: 10**(-0.4*BDdecomp.bulge(x, 0, Re_bar, n_bar))
+        return -2.5*np.log10(10**(-0.4*ue_bulge)*BDdecomp.convolve_psf(r, model_flux_1) + 10**(-0.4*u0)*BDdecomp.convolve_psf(r, model_flux_2) + 10**(-0.4*ue_bar)*BDdecomp.convolve_psf(r, model_flux_3))
+
     
     @staticmethod
     def BIC(out, x_data, y_data, model):
         n = len(x_data)
         k = len(out)
-        RSS = np.sum((model(x_data, *out) - y_data)**2)
-        return n * np.log(RSS/n) + k * np.log(n), RSS, k, n
+        RSS = np.sum((model(out, x_data) - y_data)**2)
+        return n * np.log(RSS/n) + k * np.log(n), RSS, k
+    
+    def stabilize(self, phi, theta, center0, center1, a, b, pa, n):
+        vec = center1 - center0
+        beta = np.arctan2(vec[1], vec[0])
+        v_mag = np.sqrt(vec[0]**2 + vec[1]**2)
+        r =  self.super_ellipse(phi, a, b, pa, n)
+        return v_mag * np.sin(theta - beta) - r * np.sin((phi - theta))
 
     def target_angle(self, c_r, theta):
         target_ang = np.zeros(len(c_r))
         for i, row_i in enumerate(c_r):
-            ai, bi, thetai, ni, xci, yci, *errs = row_i # fix
-            ep = self.super_ellipse(theta, ai, bi, thetai, ni, polar=False)
-            target_ang[i] = np.sqrt((ep[0])**2 + (ep[1])**2)
+            ai, bi, pai, ni, xci, yci, *errs = row_i
+            phi_i = fsolve(self.stabilize, theta, args=(theta, self.center, np.array([xci, yci]), ai, bi, pai, ni))
+            target_ang[i] =  self.super_ellipse(phi_i, ai, bi, pai, ni)
         return target_ang * 0.262
 
-    def plot_gal_iso(self, theta=None, lims=[], ax=[]):
-        if ax:
-            fig, ax = '', ax
-        else:
-            fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
-        ax.imshow(self.image, cmap='gray', origin='lower')
-        if len(lims) == 0:
-            lims = [0, len(self.image)]
-        ax.set_xlim(lims)
-        ax.set_ylim(lims)
-  
-        for row_i in self.iso_data.T[::-2]:
-            ai, bi, thetai, ni, xci, yci, *errs = row_i
-            if theta is not None:
-                xp, yp = self.super_ellipse(np.deg2rad(theta), ai, bi, thetai, ni, polar=False)
-                ax.scatter(xp+xci, yp+yci, color='blue', s=20, zorder=15)
-
-            self.patch_super_ellipse((ai, bi, thetai, ni), (xci, yci), ax, 'lime')
-        return fig, ax
-    
-    @staticmethod
-    def ellipse_para(theta, xc, yc, a, b, pa):
-        theta = np.arctan(a/b*np.tan(theta))
-        x = a*np.cos(theta)*np.cos(pa) - b*np.sin(theta)*np.sin(pa) + xc
-        y = a*np.cos(theta)*np.sin(pa) + b*np.sin(theta)*np.cos(pa) + yc
-        return x, y
-    
-    def scale_error(self):
-        mag_trim = self.image.flatten()[self.image.flatten()<25]
-        inv_trim = self.invvar.flatten()[self.image.flatten()<25]
-        mag_bins = np.round(np.arange(np.round(mag_trim.min(), 1), 25, 0.1), 1)
-
-        bins = np.digitize(mag_trim, mag_bins)
-        inv_bins = [np.mean(inv_trim[np.where(bins==i)[0]]) for i in range(len(mag_bins))]
-        scale_inv =  inv_bins/inv_trim.max()
-        fit_interp = interp1d(mag_bins, np.sqrt(scale_inv))
-        return fit_interp
-
-    def fit_profile(self, theta, plot=False):
-
-        x_data = self.target_angle(self.iso_data.T, np.deg2rad(theta))
-        xerr = self.iso_data[6]*0.262
-        mag_err = self.iso_data[10] 
-        # yerr= np.max(np.stack([mag_err, 3*xerr]), axis=0)
-        yerr = mag_err + xerr
-        # yerr=mag_err
-
-        mags_ = self.iso_data[11] 
-        max_r = len(self.image)/2 * 0.262
-
-
-        try:
-            fit_2model, fit_2errs = curve_fit(self.combine, x_data, mags_, sigma=yerr, p0=[19, 20, 6, 10, 3], 
-                                             maxfev=5000, bounds=[[17,18,0.3,0.3,0.1], [27,27,max_r,max_r,15]])
-            fit_2errs = np.sqrt(np.diag(fit_2errs))
-
-            # func_ = Model(self.combine_2d)
-            # mydata = Data(x_data, mags_, wd=xerr, we=yerr)
-            # beta0 = [20.8612786 , 23,  1.23825444,  4.1262658 ,  0.85353317]
-            # myodr = ODR(mydata, func_, beta0=beta0)
-            # myoutput = myodr.run()
-            # fit_2model, fit_2errs = myoutput.beta, myoutput.sd_beta
-
-        except RuntimeError:
-            fit_2model, fit_2errs = np.zeros(5), np.zeros(5)
-
-        try:
-            fit_1model, fit_1errs = curve_fit(self.bulge, x_data, mags_, sigma=yerr, p0=[19, 10, 4], maxfev =5000)
-            fit_1errs = np.sqrt(np.diag(fit_1errs))
-        except RuntimeError:
-            fit_1model, fit_1errs = np.zeros(3), np.zeros(3)
-
-        if plot:
-            fig, (ax1, ax2) = plt.subplots(figsize=(12, 10), dpi=100, nrows=2)
-            x_ax = np.linspace(np.min(x_data), np.max(x_data), 100)
-            ax1.errorbar(x_data, self.mags, yerr=yerr, fmt='k.', zorder=0)
-            # ax1.plot(x_data, self.mags, 'k.')
-            ax1.plot(x_ax, self.combine(x_ax, *fit_2model), 'r-', label='combined')
-            ue, u0, Re, h, n = fit_2model
-            ax1.plot(x_ax, self.bulge(x_ax, ue, Re, n), 'g--', label='bulge')
-            ax1.plot(x_ax, self.disk(x_ax, u0, h), 'b--', label='disk')
-
-            ax1.set_ylim([self.mags.min()-0.5, 25.5])
-            ax1.invert_yaxis()
-            ax1.legend(fontsize=12)
-            ax1.set_xlabel('R [arcsec]', fontsize=12)
-            ax1.set_ylabel('$\mu \:[mag\:arcsec^{-1}]$', fontsize=12)
-
-            ax2.errorbar(x_data, self.mags, yerr=yerr, fmt='k.', zorder=0)
-            # ax2.plot(x_data, self.mags, 'k.')
-            ax2.plot(x_ax, self.bulge(x_ax, *fit_1model), 'r-', label='bulge')
-
-            ax2.invert_yaxis()
-            ax2.legend(fontsize=12)
-            ax2.set_xlabel('R [arcsec]', fontsize=12)
-            ax2.set_ylabel('$\mu \:[mag\:arcsec^{-1}]$', fontsize=12)
-            return fig, (ax1, ax2), (fit_2model, fit_1model, fit_2errs, fit_1errs)
-        else:
-            return fit_2model, fit_1model, fit_2errs, fit_1errs
-            
-    def bulge_disk_2d(self):
-        ang_r = np.arange(0, 180, 5)
-        bd_res = np.zeros((len(ang_r),14))
-        for i, theta_i in enumerate(ang_r):
-            out2_i, out1_i, out2_ierr, out1_i_err = self.fit_profile(theta_i, plot=False)
-            ue_b2, u0_d2, Re_b2, h_d2, n2 = out2_i
-            ue_d2, Re_d2 = self.transform(u0_d2, h_d2, n=1)
-            ue_b1, Re_b1, n1 = out1_i
-            BT = self.B_T(*out2_i)
-            bd_res[i] = [ue_d2, Re_d2, ue_b2, Re_b2, n2, ue_b1, Re_b1, n1, BT, *out2_ierr]
+    def plot_gal_iso(self, spokes):
+        fig, ax = plt.subplots(figsize=(12, 6), dpi=100, ncols=2)
+        theta_arr =  {'g': np.linspace(0, 360-360/spokes, spokes), 'r': np.linspace(180/spokes, 360-180/spokes, spokes)}
+        for band in ['g', 'r']:
+            ax.imshow(self.image[band], cmap='gray', origin='lower')
         
-        self.decomp = bd_res
+            a_lim = self.iso_data[band][0].max()
+            min_i = np.argmin(self.iso_data[band][0])
+            xc_ref, yc_ref = self.iso_data[band][4][min_i], self.iso_data[band][5][min_i]
+            ax.set_xlim([xc_ref-a_lim-10, xc_ref+a_lim+10])
+            ax.set_ylim([yc_ref-a_lim-10, yc_ref+a_lim+10])
+
+            for theta in theta_arr[band]:
+                for row_i in self.iso_data[band].T[::-2]:
+                    ai, bi, pai, ni, xci, yci, *errs = row_i
+                    if theta is not None:
+                        phi = fsolve(self.stabilize, np.deg2rad(theta), args=(np.deg2rad(theta), self.center, 
+                                                                            np.array([xci, yci]), ai, bi, pai, ni))
+                        xp, yp = self.super_ellipse(phi, ai, bi, pai, ni, polar=False)
+                        ax.scatter(xp+xci, yp+yci, color='blue', s=10, zorder=15)
+
+                    self.patch_super_ellipse((ai, bi, pai, ni), (xci, yci), ax, band)
+        return fig, ax
+                
+    @staticmethod
+    def alpha_colormap():
+        cmap = np.zeros([256, 4])
+        cmap[:, 3] =  np.linspace(1, 0, 256)
+        cmap_red, cmap_green, cmap_blue = cmap.copy(), cmap.copy(), cmap.copy()
+        cmap_red.T[0] = 1
+        cmap_green.T[1] = 1
+        cmap_blue.T[2] = 1
+        return  ListedColormap(cmap_red), ListedColormap(cmap_green), ListedColormap(cmap_blue)
+    
+    def main_BD(self, spokes=12, mode=2, verbose=True):
+
+        def bulge_2D_model(pars, data):
+            rp = 3
+            ue_g, ue_r, n = pars[:rp]
+            ue = {'g': ue_g, 'r': ue_r}
+            def decompostion(x, theta, band):
+                Re = self.super_ellipse(np.deg2rad(theta), *pars[rp:rp+4])
+                return self.one_component(x, ue[band], Re, n)
+            data_g = np.concatenate([decompostion(data.reshape(spokes, -1)[i], angle_targets['g'][i], 'g') for i in range(spokes)])
+            data_r = np.concatenate([decompostion(data.reshape(spokes, -1)[i], angle_targets['r'][i], 'r') for i in range(spokes)])
+            return np.concatenate([data_g, data_r])
+
+        def bulge_disk_2D_model(pars, data):
+            rp = 5
+            ue_g, ue_r, u0_g, u0_r, n = pars[:rp]
+            ue = {'g': ue_g, 'r': ue_r}
+            u0 = {'g': u0_g, 'r': u0_r}
+            def decompostion(x, theta, band):
+                Re = self.super_ellipse(np.deg2rad(theta), *pars[rp:rp+4])
+                h = self.super_ellipse(np.deg2rad(theta), *pars[rp+4:rp+8])
+                return self.two_component(x, ue[band], u0[band], Re, h, n)
+            data_g = np.concatenate([decompostion(data.reshape(spokes, -1)[i], angle_targets['g'][i], 'g') for i in range(spokes)])
+            data_r = np.concatenate([decompostion(data.reshape(spokes, -1)[i], angle_targets['r'][i], 'r') for i in range(spokes)])
+            return np.concatenate([data_g, data_r])
+        
+        def bulge_bar_disk_2D_model(pars, data):
+            rp = 8
+            ue_bulge_g, ue_bulge_r, ue_bar_g, ue_bar_r, u0_g, u0_r, n_bulge, n_bar = pars[:rp]
+            ue_bulge = {'g': ue_bulge_g, 'r': ue_bulge_r}
+            ue_bar = {'g': ue_bar_g, 'r': ue_bar_r}
+            u0 = {'g': u0_g, 'r': u0_r}
+            def decompostion(x, theta, band):
+                b1, b2, b3, b4  = pars[rp:rp+4]
+                c1, c2, c3, c4 = pars[rp+4:rp+8]
+                r_mut = np.sqrt(b2*c2)
+                Re_bulge = self.super_ellipse(np.deg2rad(theta), b1, r_mut, b3, b4)
+                Re_bar = self.super_ellipse(np.deg2rad(theta), c1, r_mut, c3, c4)
+                h = self.super_ellipse(np.deg2rad(theta), *pars[rp+8:rp+12])
+                return self.three_component(x, ue_bulge[band], ue_bar[band], u0[band], Re_bulge, Re_bar, h, n_bulge, n_bar)
+            data_g = np.concatenate([decompostion(data.reshape(spokes, -1)[i], angle_targets['g'][i], 'g') for i in range(spokes)])
+            data_r = np.concatenate([decompostion(data.reshape(spokes, -1)[i], angle_targets['r'][i], 'r') for i in range(spokes)])
+            return np.concatenate([data_g, data_r])
+
+        angle_targets = {'g': np.linspace(0, 360-360/spokes, spokes), 'r': np.linspace(180/spokes, 360-180/spokes, spokes)}
+        x_data_g = np.concatenate([self.target_angle(self.iso_data['g'].T, np.deg2rad(ang_i)) for ang_i in angle_targets])
+        y_data_g = np.tile(self.iso_data['g'][11], spokes)
+        x_err_g = np.sqrt(np.tile(self.iso_data['g'][6], spokes)*np.tile(self.iso_data['g'][7], spokes))*0.262
+        y_err_g = np.tile(self.iso_data['g'][10], spokes)
+
+        x_data_r = np.concatenate([self.target_angle(self.iso_data['r'].T, np.deg2rad(ang_i)) for ang_i in angle_targets])
+        y_data_r = np.tile(self.iso_data['r'][11], spokes)
+        x_err_r = np.sqrt(np.tile(self.iso_data['r'][6], spokes)*np.tile(self.iso_data['r'][7], spokes))*0.262
+        y_err_r = np.tile(self.iso_data['r'][10], spokes)
+
+        x_data = np.concatenate([x_data_g, x_data_r])
+        y_data = np.concatenate([y_data_g, y_data_r])
+        x_err = np.concatenate([x_err_g, x_err_r])
+        y_err = np.concatenate([y_err_g, y_err_r])
+        data = Data(x_data, y_data, we=1/x_err**2, wd=1/y_err**2)
+
+        p0_1 = [23, 23, 3,  10, 8, 1, 2]
+        odr_1 = ODR(data, Model(bulge_2D_model), beta0=p0_1, maxit=3000)
+        odr_1.set_job(fit_type=mode)
+        output_1 = odr_1.run()
+        BIC_1 = self.BIC(output_1.beta, x_data, y_data, bulge_2D_model)
+        print(f'One componenet, BIC: {BIC_1[0]:.2f}, RSS: {BIC_1[1]:.2f}, fitted parameters: {BIC_1[2]}') if verbose else None
+        
+        p0_2 = [22, 21, 22, 21, 3,    3, 2, 1, 2,    5, 4, 1, 2]
+        odr_2 = ODR(data, Model(bulge_disk_2D_model), beta0=p0_2, maxit=3000)
+        odr_2.set_job(fit_type=mode)
+        output_2 = odr_2.run()
+        BIC_2 = self.BIC(output_2.beta, x_data, y_data, bulge_disk_2D_model)
+        print(f'Two componenet, BIC: {BIC_2[0]:.2f}, RSS: {BIC_2[1]:.2f}, fitted parameters: {BIC_2[2]}') if verbose else None
+
+        # p0_3 = [output_2.beta[0]*0.8, (output_2.beta[0] + output_2.beta[1])/2, output_2.beta[1]*1.2, output_2.beta[2], 0.2,  *output_2.beta[3:7],   4, 2, 2, 3,   *output_2.beta[7:11]]
+        # odr_3 = ODR(data, Model(bulge_bar_disk_2D_model), beta0=p0_3, maxit=3000)
+        # odr_3.set_job(fit_type=mode)
+        # output_3 = odr_3.run()
+
+        # b2  = output_3.beta[6]
+        # c2 = output_3.beta[10]
+        # r_mut = np.sqrt(b2*c2)
+        # output_3.beta[6] = r_mut
+        # output_3.beta[10] = r_mut
+        # BIC_3 = self.BIC(output_3.beta, x_data, y_data, bulge_bar_disk_2D_model)
+        # print(f'Three componenet, BIC: {BIC_3[0]:.2f}, RSS: {BIC_3[1]:.2f}, fitted parameters: {BIC_3[2]}')
+        self.decomp_data = {'g': [x_data_g, y_data_g, x_err_g, y_err_g], 'r': [x_data_r, y_data_r, x_err_r, y_err_r]}
+        self.decomp = [[output_1.beta, output_1.sd_beta], [output_2.beta, output_2.sd_beta], [BIC_1, BIC_2, np.argmin([BIC_1[0], BIC_2[0]])]]
+        # self.decomp = [[output_1.beta, output_1.sd_beta], [output_2.beta, output_2.sd_beta], [output_3.beta, output_3.sd_beta], [BIC_1, BIC_2, BIC_3, np.argmin([BIC_1[0], BIC_2[0], BIC_3[0]])]]
+        # result = ['single Bulge preferred', 'Bulge + Disk preferred', 'Bulge + Bar + Disk preferred'][self.decomp[3][3]]
+        # print(result) if verbose else None
+
+
+    def plot_spokes(self, band, spokes=12, sigma=3, n_model=2):
+       
+        theta = {'g': np.linspace(0, 360-360/spokes, spokes), 'r': np.linspace(180/spokes, 360-180/spokes, spokes)}[band][::2]
+        bd_data = self.decomp_data[band]
+        x_data, y_data = bd_data[0][::int(spokes/6)], bd_data[1][::int(spokes/6)], 
+        x_err, y_err = bd_data[2][::int(spokes/6)], bd_data[3][::int(spokes/6)]
+
+        rp = [3, 5, 8][n_model-1]
+        fig, axis = plt.subplots(figsize=(18, 10), ncols=2, nrows=3, dpi=100)
+        for i in range(6):
+            ax = axis.flatten()[i]
+            x_ax = np.linspace(x_data.min()-0.2, x_data.max()+0.2, 100)
+            ax.errorbar(x_data[i], y_data[i],yerr=sigma*y_err[i], xerr=sigma*x_err[i], fmt='k.', zorder=0, label=fr'{sigma} sigma,  $\theta =${theta[i]:.0f}$^\circ$')
+            ax.set_ylim([y_data.min()-0.5, 25.5])
+            ax.invert_yaxis()
+            ax.legend()
+
+        if n_model == 3:
+            ue_bulge_g, ue_bulge_r, ue_bar_g, ue_bar_r, u0_g, u0_r, n_bulge, n_bar = self.decomp[n_model-1][0][:rp]
+            ue_bulge = {'g': ue_bulge_g, 'r': ue_bulge_r}[band]
+            ue_bar = {'g': ue_bar_g, 'r': ue_bar_r}[band]
+            u0_disk = {'g': u0_g, 'r': u0_r}[band]
+            for i in range(6):
+                ax = axis.flatten()[i]
+                Re_bulge = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp:rp+4])
+                Re_bar = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp+4:rp+8])
+                h_disk = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp+8:rp+12])
+                ax.plot(x_ax, self.three_component(x_ax, ue_bulge, ue_bar, u0_disk, Re_bulge, Re_bar, h_disk, n_bulge, n_bar), 'r-', label='combined')
+                ax.plot(x_ax, self.one_component(x_ax, ue_bulge, Re_bulge, n_bulge), 'g--', label='bulge')
+                ax.plot(x_ax, self.one_component(x_ax, ue_bar, Re_bar, n_bar), 'g--', label='bar', color='lime')
+                ax.plot(x_ax, self.one_component_disk(x_ax, u0_disk, h_disk), 'b--', label='disk')
+
+        elif n_model == 2:
+            ue_g, ue_r, u0_g, u0_r, n_sersic = self.decomp[n_model-1][0][:rp]
+            ue_bulge = {'g': ue_g, 'r': ue_r}[band]
+            u0_disk = {'g': u0_g, 'r': u0_r}[band]
+            for i in range(6):
+                ax = axis.flatten()[i]
+                Re_bulge = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp:rp+4])
+                h_disk = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp+4:rp+8])
+                ax.plot(x_ax, self.two_component(x_ax, ue_bulge, u0_disk, Re_bulge, h_disk, n_sersic), 'r-', label='combined')
+                ax.plot(x_ax, self.one_component(x_ax, ue_bulge, Re_bulge, n_sersic), 'g--', label='bulge')
+                ax.plot(x_ax, self.one_component_disk(x_ax, u0_disk, h_disk), 'b--', label='disk')
+
+        elif n_model == 1:
+            ue_g, ue_r, n_sersic = self.decomp[n_model-1][0][:rp]
+            ue_bulge = {'g': ue_g, 'r': ue_r}[band]
+            for i in range(6):
+                ax = axis.flatten()[i]
+                Re_bulge = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp:rp+4])
+                ax.plot(x_ax, self.one_component(x_ax, ue_bulge, Re_bulge, n_sersic), 'r-', label='bulge')      
+           
+
+    def SB_profile(self, r, theta, band, model='all', n_model=2, psf=0):
+        rp = [3, 5, 8][n_model-1]
+        arcsec2px = np.array([0.262, 0.262, 1, 1])
+        models = {'bulge': [self.bulge, self.one_component][psf], 'disk': [self.disk, self.one_component_disk][psf],
+                  'two_c': [self.combine, self.two_component][psf], 'three_c': [self.combine_3, self.three_component][psf]}
+        if n_model == 3:
+            ue_bulge_g, ue_bulge_r, ue_bar_g, ue_bar_r, u0_g, u0_r, n_bulge, n_bar = self.decomp[n_model-1][0][:rp]
+            ue_bulge = {'g': ue_bulge_g, 'r': ue_bulge_r}[band]
+            ue_bar = {'g': ue_bar_g, 'r': ue_bar_r}[band]
+            u0_disk = {'g': u0_g, 'r': u0_r}[band]
+            Re_bulge = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp:rp+4]/arcsec2px)
+            Re_bar = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp+4:rp+8]/arcsec2px)
+            h_disk = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp+8:rp+12]/arcsec2px)
+            if model == 'bulge':
+                return models['bulge'](r, ue_bulge, Re_bulge, n_bulge)
+            elif model == 'bar':
+                return models['bulge'](r, ue_bar, Re_bar, n_bar)
+            elif model == 'disk':
+                return models['disk'](r, u0_disk, h_disk)
+            else:
+                return models['three_c'](r, ue_bulge, ue_bar, u0_disk, Re_bulge, Re_bar, h_disk, n_bulge, n_bar)
+            
+        elif n_model == 2:
+            ue_g, ue_r, u0_g, u0_r, n_sersic = self.decomp[n_model-1][0][:rp]
+            ue_bulge = {'g': ue_g, 'r': ue_r}[band]
+            u0_disk = {'g': u0_g, 'r': u0_r}[band]
+            Re_bulge = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp:rp+4]/arcsec2px)
+            h_disk = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp+4:rp+8]/arcsec2px)
+            if model == 'bulge':
+                return models['bulge'](r, ue_bulge, Re_bulge, n_sersic)
+            elif model == 'disk':
+                return models['disk'](r, u0_disk, h_disk)
+            else:
+                 return models['two_c'](r, ue_bulge, u0_disk, Re_bulge, h_disk, n_sersic)
+            
+        elif n_model == 1:
+            ue_g, ue_r, n_sersic = self.decomp[n_model-1][0][:rp]
+            ue_bulge = {'g': ue_g, 'r': ue_r}[band]
+            Re_bulge = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp:rp+4]/arcsec2px)
+            return models['bulge'](r, ue_bulge, Re_bulge, n_sersic)
+    
+  
+    def SB_isophote(self, isophote, band, n_model, model='both'): 
+        def radial(isophote, theta):
+            sb_profile = lambda r: self.SB_profile(r, theta, band=band, n_model=n_model, model=model) - isophote
+            return fsolve(sb_profile, 1)
+
+        theta = np.linspace(0, 2*np.pi, 50)
+        r = np.vectorize(radial)(isophote, theta)
+
+        out_pars = curve_fit(self.super_ellipse, theta, r, p0=[r.max(), r.min(), 0,  2], maxfev=5000)
+        check = np.mean(self.SB_profile(r, theta)) - isophote
+        return [out_pars[0], np.sqrt(np.diag(out_pars[1])), np.round(check, 3)] 
+
+    def plot_SB_profile(self, band, isophote=False, subtarct=False, n_model=2):
+        n_size = np.arange(len(self.image[band]))
+        xm, ym = np.meshgrid(n_size, n_size)
+        rm = np.linalg.norm(np.stack([xm, ym]).T - self.center, axis=2)
+
+        theta_top = np.arccos(np.dot(np.stack([xm, ym]).T - self.center, np.array([0,1]))/rm)[len(n_size)//2:]
+        theta_bot = np.arccos(np.dot(np.stack([xm, ym]).T - self.center, np.array([0,-1]))/rm)[:len(n_size)//2]
+        thetam = np.vstack([theta_bot, theta_top])
+        thetam[np.isnan(thetam)] = 0
+
+        bulge_arr = self.SB_profile(rm, thetam, model='bulge', n_model=n_model, band=band)
+        bar_arr = self.SB_profile(rm, thetam, model='bar', n_model=n_model, band=band)
+        disk_arr = self.SB_profile(rm, thetam, model='disk', n_model=n_model, band=band)
+        both_arr = self.SB_profile(rm, thetam, model='all', n_model=n_model, band=band)
+
+        std = self.gobj[band].brick['psfsize']/(2*np.sqrt(2*np.log(2)))/0.262
+        kernal = Gaussian2DKernel(x_stddev=std, y_stddev=std)
+        both_arr = -2.5*np.log10(convolve_fft(10**(-0.4*both_arr), kernal))
+
+        reds, greens, blues = self.alpha_colormap()
+
+        if not subtarct:
+            fig, ax = self.gobj.plot()
+            rp = [3, 5, 8][n_model-1]
+            arcsec2px = np.array([0.262, 0.262, 1, 1])
+            if n_model == 3:
+                self.patch_super_ellipse(self.decomp[n_model-1][0][rp:rp+4]/arcsec2px, self.center, ax, 'red', label='Bulge $R_e$')
+                self.patch_super_ellipse(self.decomp[n_model-1][0][rp+4:rp+8]/arcsec2px, self.center, ax, 'green', label='Bar $R_e$')
+
+                disk_a, disk_b, disk_pa, disk_n = self.decomp[n_model-1][0][rp+8:rp+12]
+                u0_g, u0_r = self.decomp[n_model-1][0][4:rp-2]
+                u0_disk = {'g': u0_g, 'r': u0_r}[band]
+                ue_disk, (disk_a, disk_b) = self.transform(u0_disk, [disk_a, disk_b], n=1)
+                self.patch_super_ellipse(np.array([disk_a, disk_b, disk_pa, disk_n])/arcsec2px, self.center, ax, 'blue', label='Disk $R_e$')
+                ax.imshow(disk_arr, cmap=blues, vmax=26)
+                ax.imshow(bar_arr, cmap=greens, vmax=26)
+
+            elif n_model == 2:
+                self.patch_super_ellipse(self.decomp[n_model-1][0][rp:rp+4]/arcsec2px, self.center, ax, 'red', label='Bulge $R_e$')
+                u0_g, u0_r = self.decomp[n_model-1][0][2:rp-1]
+                u0_disk = {'g': u0_g, 'r': u0_r}[band]
+                disk_a, disk_b, disk_pa, disk_n = self.decomp[n_model-1][0][rp+4:rp+8]
+                ue_disk, (disk_a, disk_b) = self.transform(u0_disk, [disk_a, disk_b], n=1)
+                self.patch_super_ellipse(np.array([disk_a, disk_b, disk_pa, disk_n])/arcsec2px, self.center, ax, 'blue', label='Disk $R_e$')
+                ax.imshow(disk_arr, cmap=blues, vmax=26)
+
+            elif n_model == 1:
+                self.patch_super_ellipse(self.decomp[n_model-1][0][rp:rp+4]/arcsec2px, self.center, ax, 'red', label='Bulge $R_e$')
+            
+            ax.imshow(bulge_arr, cmap=reds, vmax=26)
+            if isophote:
+                wi = 0.1
+                mag_25 = np.where((self.image.T > isophote-wi) & (self.image[band].T < isophote+wi))
+                ax.plot(mag_25[0], mag_25[1], 'g.', c='green', ms=2, zorder=5, label=f'{isophote} mag/arcsec$^2$')
+
+                pars, errs, check = self.SB_isophote(isophote, band, n_model)
+                self.patch_super_ellipse(pars, self.center, ax, 'lime') if check == 0 else None
+
+            ax.legend(framealpha=1, fontsize=7, loc=1)
+
+        if subtarct:
+            def sub_mag(m1, m2):
+                return -2.5*np.log10(np.abs(10**(-0.4*m1) - 10**(-0.4*m2)))
+    
+            fig, (ax1, ax2, ax3) = plt.subplots(figsize=(18, 6), ncols=3, dpi=100)
+            sky_mag = self.gobj[band].cutout['mag_raw'].copy()
+            sky_mag[np.isnan(sky_mag)] = self.gobj[band].brick['psfdepth']
+            ax1.imshow(sky_mag, origin='lower', cmap='gray', vmax=30, vmin=19)
+
+            ax2.imshow(disk_arr, cmap=blues, origin='lower', vmax=25) if (n_model == 2) or (n_model == 3) else None
+            ax2.imshow(bar_arr, cmap=greens, origin='lower', vmax=25) if n_model == 3 else None
+            ax2.imshow(bulge_arr, cmap=reds, origin='lower', vmax=25)
+
+            ax3.imshow(sub_mag(sky_mag, both_arr), origin='lower', cmap='gray', vmax=30, vmin=19)
+            plt.tight_layout()
+
+        
+
 
 
 class galaxy_decomp_old:
@@ -1427,3 +1708,185 @@ class BDdecomp_old:
 
         plt.tight_layout()
         return fig, ax
+    
+
+class galaxy_decomp_old2:
+    def __init__(self, target_name, verbose, mask, band, source,  size='z', catalog='ztf'):
+        self.verbose = verbose
+        self.gobj = HostGal(verbose=verbose)
+        if catalog == 'ztf':
+            self.gobj.init_dr2(target_name)
+        else:
+            self.gobj.init_query(target_name, catalog)
+        self.gobj.get_image(source=source, survey='auto', output_=size, band=band, scale=0.262)
+
+        self.contours = {}
+        self.image = self.gobj.cutout['mag']
+        self.invvar = self.gobj.cutout['invvar']    
+        self.flux = self.gobj.cutout['flux']
+        self.mask = mask
+        self.center =  np.array(self.image.shape)//2
+
+    def plot_fit(self, isophotes, width=0.5, mask=False, zoom=False):
+        fig, (ax1, ax2) = plt.subplots(figsize=(12, 6), dpi=100, ncols=2)
+        mag, wcs = self.image, self.gobj.cutout['wcs']
+        ax2.imshow(mag, cmap='gray', origin='lower')
+
+        (sn_ra, sn_dec) = self.gobj.gal['sn']
+        c = SkyCoord(ra=sn_ra*u.degree, dec=sn_dec*u.degree, frame='icrs')
+        sn_px = wcs.world_to_pixel(c)
+        ax2.scatter(sn_px[0], sn_px[1], c='cyan', s=40, lw=2, fc='None', ec='cyan')
+
+        if np.any(mask):
+            for (ra, dec, r, c) in mask:
+                coords = SkyCoord(ra=ra*u.degree, dec=dec*u.degree, frame='icrs')
+                m_px = self.gobj.cutout['wcs'].world_to_pixel(coords)
+                radius = r*(c*-0.5+1)
+                m_patch = Ellipse((m_px[0], m_px[1]), 2*radius, 2*radius, 0, edgecolor='black', facecolor='black', zorder=10, alpha=0.5)
+                ax1.add_patch(m_patch)
+  
+        targets = self.contours.keys() if isophotes == 'all' else isophotes
+        for i, iso_i in enumerate(targets):
+            params, px_data = self.contours[iso_i]
+            a, b, theta, n, xc, yc, *err = params
+            px_all, px_fit = px_data
+
+            norm = np.stack(np.where((mag.T > iso_i-width) & (mag.T < iso_i+width))).T
+            ax2.scatter(norm.T[0], norm.T[1], s=2, marker='o', zorder=0, color='red', label=f'{iso_i:.1f} $\pm$ {width}')
+            if np.any(px_fit):
+                ax1.scatter(px_fit.T[0], px_fit.T[1], s=2, marker='o', zorder=1, color='blue', label=f'{iso_i:.1f} fitted')
+            if np.any(px_all):
+                ax1.scatter(px_all.T[0], px_all.T[1], s=2, marker='o',zorder=0, color='red', label=f'{iso_i:.1f} removed')
+           
+            if xc != 0:
+                self.patch_super_ellipse((a, b, theta, n), (xc, yc), ax1, 'red')
+                self.patch_super_ellipse((a, b, theta, n), (xc, yc), ax2, 'lime')
+                if zoom:
+                    ax1.set_xlim([xc-a-10, xc+a+10])
+                    ax2.set_xlim([xc-a-10, xc+a+10])
+                    ax1.set_ylim([yc-a-10, yc+a+10])
+                    ax2.set_ylim([yc-a-10, yc+a+10])
+
+                else:
+                    ax1.set_xlim(*ax2.get_xlim())
+                    ax1.set_ylim(*ax2.get_ylim())
+
+        ax1.legend(framealpha=0.8, markerscale=5, loc=2)
+        ax2.legend(framealpha=1, markerscale=5, loc=2)
+        plt.tight_layout()
+        return ax1, ax2
+        
+    def prep_pixels(self, isophote, blur, window):
+        kernal3 = np.array([[ 0,  1,  1],
+                            [ -1,  0,  1],
+                            [-1,  -1,  0,]])
+
+        kernal_ = 1/(kernal3 + isophote)
+        kernal_unit = kernal_ / np.sum(kernal_)
+        conv_blur = gaussian_filter(self.image, sigma=blur)
+        convolve_1 = convolve2d(conv_blur, kernal_unit, mode='same')
+        convolve_2 = convolve2d(convolve_1, kernal_unit[::-1], mode='same')
+
+        convolve_2[:5,:] = 0
+        convolve_2[-5:,:] = 0
+        convolve_2[:,:5] = 0
+        convolve_2[:,-5:] = 0
+        
+        contour = np.stack(np.where((convolve_2.T > isophote-window) & (convolve_2.T < isophote+window)))
+        return contour
+
+    @staticmethod
+    def super_ellipse(phi, a_, b_, pa, n, polar=True):
+        a, b = max(a_, b_), min(a_, b_)
+        # def super_transform(phi):
+        #     return np.arctan((a/b)**(n/2) * np.abs(np.tan(phi))**(n/2) * np.sign(np.tan(phi)))
+
+        # theta = super_transform(phi-pa)
+        # x_ = a*np.abs(np.cos(theta))**(2/n)*np.sign(np.cos(theta))  
+        # y_ = b*np.abs(np.sin(theta))**(2/n)*np.sign(np.sin(theta)) 
+
+        r = (np.abs(np.cos(phi-pa)/a)**n + np.abs(np.sin(phi-pa)/b)**n ) **(-1/n)
+        if polar:
+            return r
+        else:
+            x = r*np.cos(phi)
+            y = r*np.sin(phi)
+            return x, y
+
+    def super_ellipse_fitter(self, data, err):
+        ell = EllipseModel()
+        ell.estimate(data)
+        if ell.params is None:
+            return np.zeros(4), np.zeros(4), (0,0)
+        xc, yc, a, b, pa = ell.params
+        x, y = data.T
+        # if fix_center:
+        #     xc, yc = self.center
+        r = np.sqrt((x-xc)**2 + (y-yc)**2)
+        phi = np.arctan2(y-yc, x-xc)
+        out_pars = curve_fit(self.super_ellipse, phi, r, p0=[a, b, pa, 2], maxfev=5000, sigma=err)
+        return out_pars[0], np.sqrt(np.diag(out_pars[1])), (xc, yc)
+
+    def patch_super_ellipse(self, pars, center, ax, color, label=None):
+        t_r = np.arange(-np.pi/2, np.pi/2, 0.01)+ pars[2]
+        xse, yse = self.super_ellipse(t_r, *pars, polar=False) 
+        xse_t = np.concatenate([xse, -xse])+ center[0]
+        yse_t = np.concatenate([yse, -yse])+ center[1]
+        ax.plot(xse_t, yse_t, 'r-', color=color, zorder=10, label=label)
+        ax.plot(xse_t[[0, -1]], yse_t[[0, -1]], 'r-', color=color, zorder=10)
+
+    def extract_regions(self, contour, mask):
+        def get_pixels(region, connect): return np.stack(np.where(connect == region))
+
+        binary_image = np.zeros_like(self.image, dtype=np.uint8)
+        binary_image[contour[0], contour[1]] = 1
+        connect_ = ConnectRegion(binary_image, connectivity=2, background=0)
+        region_count = np.asarray(np.unique(connect_, return_counts=True)).T[1:].T
+        galaxy_region = max(region_count.T, key=lambda x: x[1])[0]
+
+        if np.any(mask):
+            for (ra, dec, r, c) in mask:
+                coords = SkyCoord(ra=ra*u.degree, dec=dec*u.degree, frame='icrs')
+                m_px = self.gobj.cutout['wcs'].world_to_pixel(coords)
+                radius = r*(c*-0.5+1)
+                ell_px = draw.ellipse(m_px[0], m_px[1], radius, radius, rotation=0)
+                mask = np.ones_like(self.image)
+                px_cutoff = (ell_px[0] < self.image.shape[0]) & (ell_px[1] < self.image.shape[0])
+                mask[ell_px[0][px_cutoff], ell_px[1][px_cutoff]] = 0
+                connect_ = connect_ * mask
+
+        return get_pixels(galaxy_region, connect_).T         
+           
+    def contour_fit(self, isophote, window, mask, blur=0):
+        all_pixels  = self.prep_pixels(isophote, blur=blur, window=window)
+        connect_all = self.extract_regions(all_pixels, mask=mask)
+
+        if len(connect_all) > 25:
+            var_frac = np.abs(-2.5/np.log(10)*np.sqrt(1/self.invvar)/self.flux)
+
+            fit_vals = self.image.T[connect_all.T[0], connect_all.T[1]]
+            fit_invvar = var_frac.T[connect_all.T[0], connect_all.T[1]]
+            cuts = (fit_vals > isophote-window) & (fit_vals < isophote+window)
+            connect_all, fit_vals, fit_invvar = connect_all[cuts], fit_vals[cuts], fit_invvar[cuts]
+
+            def linear(x, a, b): return a*x + b
+            slope_corr = curve_fit(linear, fit_vals, fit_invvar)
+
+            px_uncertainity =  fit_invvar/linear(fit_vals, *slope_corr[0])
+            pars, pars_err, center = self.super_ellipse_fitter(connect_all, px_uncertainity)
+
+            self.contours[isophote] = [[*pars, *center, *pars_err, fit_invvar.mean(), fit_vals.mean()], [all_pixels, connect_all]]
+            
+        else:
+            self.contours[isophote] = [[0,0,0,0,0,0,0,0,0,0,0,0], [[], []]]
+
+    def main_run(self, width, blur=0):
+        step = 0.2
+        for iso in np.arange(24.8, 16, -step):
+            iso = np.round(iso, 1)
+            print(iso) if (iso%1==0.0 and self.verbose) else None
+            self.contour_fit(iso, width, mask=[], blur=blur)
+            if len(self.contours[iso][1][1]) == 0:
+                del self.contours[iso]
+                break
+
