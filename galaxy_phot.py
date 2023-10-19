@@ -9,6 +9,7 @@ from io import BytesIO
 from extinction import fm07
 from astropy.io import fits
 from astropy.wcs import WCS
+from snpy import kcorr, fset
 from astropy import units as u
 from astropy.table import Table
 import matplotlib.pyplot as plt
@@ -16,7 +17,7 @@ from scipy.integrate import quad
 from skimage import measure, draw
 from scipy.signal import convolve2d
 # from astroquery.ipac.ned import Ned
-# from astroquery.vizier import Vizier
+from astroquery.vizier import Vizier
 from astropy.cosmology import Planck18
 from matplotlib.patches import Ellipse
 from scipy.interpolate import interp1d, RegularGridInterpolator
@@ -33,8 +34,12 @@ from astropy.convolution import convolve_fft, Gaussian2DKernel
 
 sample = ztfidr.get_sample()
 host_data = ztfidr.io.get_host_data()
-# Vizier.ROW_LIMIT = 1000
-# qs = Vizier.get_catalogs('J/ApJS/196/11/table2')
+Vizier.ROW_LIMIT = 1000
+disk_proj = Vizier.get_catalogs('J/A+A/553/A80/tablea1')[0].to_pandas()
+bulge_proj = Vizier.get_catalogs('J/A+A/553/A80/tablea4')[0].to_pandas()
+disk_dust = Vizier.get_catalogs('J/A+A/553/A80/dexp')[0].to_pandas()
+bulge_dust = Vizier.get_catalogs('J/A+A/553/A80/ebser')[0].to_pandas()
+
 df_update = pd.read_csv('dr2/tables/.dataset_creation/host_prop/host_match/ztfdr2_matched_hosts.csv', index_col=0)
 df_gp = pd.read_csv('csv_files/ZTFidr_all_gri_kcor_salt_gp_fitted_clipped_z_0.3.csv', index_col=0)
 df10 = Table.read('fits_files/survey-bricks-dr10-south.fits.gz', format='fits')
@@ -44,7 +49,15 @@ df_bd1 = pd.read_csv('csv_files/one_decomp.csv', index_col=0)
 df_bd2 = pd.read_csv('csv_files/two_decomp.csv', index_col=0)
 df_bd3 = pd.read_csv('csv_files/three_decomp.csv', index_col=0)
 df_bd0 = pd.read_csv('csv_files/disk_decomp.csv', index_col=0)
-rss_save = pd.read_csv('csv_files/rss_save.csv', index_col=0)
+
+df_E = pd.read_csv('templates/E',delim_whitespace=True,names=['wl','fl'])
+df_s0 = pd.read_csv('templates/s0',delim_whitespace=True,names=['wl','fl'])
+df_sab =  pd.read_csv('templates/sb',delim_whitespace=True,names=['wl','fl'])
+df_sc =  pd.read_csv('templates/sc',delim_whitespace=True,names=['wl','fl'])
+
+df_bulge = fits.open('templates/old_temp/bulge_template.fits')
+wl_b, fl_b = df_bulge[1].data['WAVELENGTH'], df_bulge[1].data['FLUX']
+df_b = pd.DataFrame(np.column_stack([wl_b, fl_b]), columns=['wl', 'fl'])
 
 
 
@@ -168,6 +181,8 @@ class HostGal:
         axis_offset = np.sign([fits_list[li].header['NAXIS1'] - fits_list[si].header['NAXIS1'], fits_list[li].header['NAXIS2'] - fits_list[si].header['NAXIS2']])
         vec = (vector_offset*axis_offset).astype(int)
         attach = (vec*np.array([1, -1]))[np.where(vec!=0)[0]]
+        if len(attach) > 1:
+            return [],[],[],[]
 
         slice_dictx = [[shape_s[0]-(size-shape_l[0]), shape_s[0]], [0, size-shape_l[0]]]
         slice_dicty = [[0, size-shape_l[1]], [shape_s[1]-(size-shape_l[1]), shape_s[1]]]
@@ -213,13 +228,14 @@ class HostGal:
                 return results
 
         flux, invvar, wcs, brick = self.construct_image(fits_data, output_size, band)
-        self.brick = brick
-        mag = self.flux2mag(flux, band, scale, soft=True)
-        mag_raw = self.flux2mag(flux, band, scale, soft=False)
-        self.cutout = {'flux': flux, 'mag': mag, 'mag_raw': mag_raw, 'invvar': invvar, 'wcs': wcs, 'scale': scale, 'band': band}
-        
-        print(brick['dr'], *mag.shape) if self.verbose else None
-        fits_data.close()
+        if len(flux) != 0:
+            self.brick = brick
+            mag = self.flux2mag(flux, band, scale, soft=True)
+            mag_raw = self.flux2mag(flux, band, scale, soft=False)
+            self.cutout = {'flux': flux, 'mag': mag, 'mag_raw': mag_raw, 'invvar': invvar, 'wcs': wcs, 'scale': scale, 'band': band}
+            
+            print(brick['dr'], *mag.shape) if self.verbose else None
+            fits_data.close()
         
     def plot(self):
         wcs, mag = self.cutout['wcs'], self.cutout['mag']
@@ -245,7 +261,8 @@ class galaxy_decomp:
     def __init__(self, target_name, verbose, mask, source, size='z', catalog='ztf'):
         self.verbose = verbose
         self.name = target_name
-        self.gobj = {'g': HostGal(verbose=verbose), 'r': HostGal(verbose=verbose)}
+        self.gobj = {'g': HostGal(verbose=verbose), 'r': HostGal(verbose=False)}
+        self.contours = {'g': {}, 'r': {}}
         if catalog == 'ztf':
             self.gobj['g'].init_dr2(target_name)
             self.gobj['r'].init_dr2(target_name)
@@ -255,7 +272,10 @@ class galaxy_decomp:
         self.gobj['g'].get_image(source=source, size=size, band='g', scale=0.262)
         self.gobj['r'].get_image(source=source, size=size, band='r', scale=0.262)
 
-        self.contours = {'g': {}, 'r': {}}
+        if len(self.gobj['g'].cutout) == 0:
+            print('no image') if verbose else None
+            return
+
         self.image = {'g': self.gobj['g'].cutout['mag'], 'r': self.gobj['r'].cutout['mag']}
         self.invvar = {'g': self.gobj['g'].cutout['invvar'], 'r': self.gobj['r'].cutout['invvar']} 
         self.flux = {'g': self.gobj['g'].cutout['flux'], 'r': self.gobj['r'].cutout['flux']} 
@@ -430,9 +450,10 @@ class galaxy_decomp:
         
     def load_main_run(self):
         iso_data = df_iso[df_iso['sn_name'] == self.name]
-        for i in range(len(iso_data)):
-            data_i = iso_data.iloc[i]
-            self.contours[data_i['band']][np.round(data_i['mag'],1)] = [data_i.values[2:].astype(float)]
+        if iso_data.iloc[0]['band'] != 'error':    
+            for i in range(len(iso_data)):
+                data_i = iso_data.iloc[i]
+                self.contours[data_i['band']][np.round(data_i['mag'],1)] = [data_i.values[2:].astype(float)]
 
 
 
@@ -449,10 +470,13 @@ class BDdecomp:
         mags_r, iso_data_r = self.extract_data('r')
         self.mags = {'g': mags_g, 'r': mags_r}
         self.iso_data = {'g': iso_data_g, 'r': iso_data_r}
-        self.center, self.iso_stat = self.contour_stats()
+        if (len(iso_data_g) > 0) and  (len(iso_data_r) > 0):
+            self.center, self.iso_stat = self.contour_stats()
 
     def extract_data(self, band):
         key_targs = list(self.contours[band].keys())
+        if len(key_targs) == 0:
+            return [], []
         pars_ = np.array([self.contours[band][iso_key][0] for iso_key in key_targs if len(self.contours[band][iso_key][0]) > 0]).T
 
         offsets = np.sqrt((pars_[4]-self.center[0])**2 + (pars_[5]-self.center[1])**2)
@@ -461,7 +485,7 @@ class BDdecomp:
         mags = np.array(key_targs)[cuts]
         pars_ = pars_.T[cuts].T.reshape((12, -1))
         if len(pars_) == 0:
-            raise ValueError
+            return [], []
 
         return mags, pars_
     
@@ -564,14 +588,7 @@ class BDdecomp:
     def combine_3(x, ue_bulge, ue_bar, u0, Re_bulge, Re_bar, h, n_bulge, n_bar):
         bar_bulge = BDdecomp.add_mag(BDdecomp.bulge(x, ue_bulge, Re_bulge, n_bulge), BDdecomp.bulge(x, ue_bar, Re_bar, n_bar))
         return BDdecomp.add_mag(bar_bulge, BDdecomp.disk(x, u0, h))
-   
-    @staticmethod
-    def BIC(out, x_data, y_data, model):
-        n = len(x_data)
-        k = len(out)
-        RSS = np.sum((model(out, x_data) - y_data)**2)
-        return n * np.log(RSS/n) + k * np.log(n), RSS, k
-    
+       
     def stabilize(self, phi, theta, center0, center1, a, b, pa, n):
         vec = center1 - center0
         beta = np.arctan2(vec[1], vec[0])
@@ -658,7 +675,7 @@ class BDdecomp:
                 c2_a[2], c2_b[2], pa, 2, c2_a[3], c2_b[3], pa, 2]
         return p0_1, p0_2
     
-    def create_data(self, spokes):
+    def create_data(self, spokes, plot=False):
         angle_targets = {'g': np.linspace(0, 360-360/spokes, spokes), 'r': np.linspace(180/spokes, 360-180/spokes, spokes)}
         x_data_g = np.concatenate([self.target_angle(self.iso_data['g'].T, np.deg2rad(ang_i)) for ang_i in angle_targets['g']]) * 0.262
         x_err_g = np.concatenate([self.error_prop_SE(ang_i, *[self.iso_data['g'][i] for i in [0,1,2,3,6,7,8,9]]) for ang_i in angle_targets['g']]) * 0.262
@@ -670,23 +687,24 @@ class BDdecomp:
         y_data_r = np.tile(self.iso_data['r'][11], spokes)
         y_err_r = np.tile(self.iso_data['r'][10], spokes)
 
-        # ci = np.round(self.center).astype(int)
-        # cmag_g = self.image['g'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
-        # cmag_r = self.image['r'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
-        # x_, x_err = 0.262, 0.262/3
-        # y_g, y_g_err = np.min(cmag_g), np.std(cmag_g)
-        # y_r, y_r_err = np.min(cmag_r), np.std(cmag_r)
-        # g_len, r_len = len(x_data_g.reshape(spokes, -1)[0]), len(x_data_r.reshape(spokes, -1)[0])
+        if plot:
+            ci = np.round(self.center).astype(int)
+            cmag_g = self.image['g'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
+            cmag_r = self.image['r'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
+            x_, x_err = 0.262, 0.262/3
+            y_g, y_g_err = np.min(cmag_g), np.std(cmag_g)
+            y_r, y_r_err = np.min(cmag_r), np.std(cmag_r)
+            g_len, r_len = len(x_data_g.reshape(spokes, -1)[0]), len(x_data_r.reshape(spokes, -1)[0])
 
-        # x_data_g = np.insert(x_data_g.reshape(spokes, -1), g_len, x_, axis=1).flatten()
-        # x_err_g = np.insert(x_err_g.reshape(spokes, -1), g_len, x_err, axis=1).flatten()
-        # y_data_g = np.insert(y_data_g.reshape(spokes, -1), g_len, y_g, axis=1).flatten()
-        # y_err_g = np.insert(y_err_g.reshape(spokes, -1), g_len, y_g_err, axis=1).flatten()
+            x_data_g = np.insert(x_data_g.reshape(spokes, -1), g_len, x_, axis=1).flatten()
+            x_err_g = np.insert(x_err_g.reshape(spokes, -1), g_len, x_err, axis=1).flatten()
+            y_data_g = np.insert(y_data_g.reshape(spokes, -1), g_len, y_g, axis=1).flatten()
+            y_err_g = np.insert(y_err_g.reshape(spokes, -1), g_len, y_g_err, axis=1).flatten()
 
-        # x_data_r = np.insert(x_data_r.reshape(spokes, -1), r_len, x_, axis=1).flatten()
-        # x_err_r = np.insert(x_err_r.reshape(spokes, -1), r_len, x_err, axis=1).flatten()
-        # y_data_r = np.insert(y_data_r.reshape(spokes, -1), r_len, y_r, axis=1).flatten()
-        # y_err_r = np.insert(y_err_r.reshape(spokes, -1), r_len, y_r_err, axis=1).flatten()
+            x_data_r = np.insert(x_data_r.reshape(spokes, -1), r_len, x_, axis=1).flatten()
+            x_err_r = np.insert(x_err_r.reshape(spokes, -1), r_len, x_err, axis=1).flatten()
+            y_data_r = np.insert(y_data_r.reshape(spokes, -1), r_len, y_r, axis=1).flatten()
+            y_err_r = np.insert(y_err_r.reshape(spokes, -1), r_len, y_r_err, axis=1).flatten()
 
         x_data = np.concatenate([x_data_g, x_data_r])
         y_data = np.concatenate([y_data_g, y_data_r])
@@ -778,11 +796,11 @@ class BDdecomp:
             data_r = np.concatenate([model_psf(data['r'].reshape(spokes, -1)[i], angle_targets['r'][i], 'r', psf_interp) for i in range(spokes)])
             return np.concatenate([data_g, data_r])
 
-        return disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model
+        return bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model
 
 
     def main_BD(self, spokes=12, mode=0, verbose=True, disk=1, init_2=[]):
-        disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model = self.fit_functions(spokes)
+        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes)
 
         self.decomp_data = self.create_data(spokes)
         x_data, y_data, x_err, y_err = self.decomp_data['all']
@@ -792,25 +810,18 @@ class BDdecomp:
         odr_1 = ODR(data, Model(bulge_2D_model), beta0=p0_1, maxit=10)
         odr_1.set_job(fit_type=mode)
         output_1 = odr_1.run()
-        BIC_1 = self.BIC(output_1.beta, x_data, y_data, bulge_2D_model)
         self.decomp[0] = [[*output_1.beta], [*output_1.sd_beta]]
-        print(f'One componenet, BIC: {BIC_1[0]:.2f}, RSS: {BIC_1[1]:.2f}, fitted parameters: {BIC_1[2]}') if verbose else None
         
         if output_1.beta[2] > disk:
             p0_2 = init_2 if init_2 else p0_2
             odr_2 = ODR(data, Model(bulge_disk_2D_model), beta0=p0_2, maxit=10)
             odr_2.set_job(fit_type=mode)
             output_2 = odr_2.run()
-            BIC_2 = self.BIC(output_2.beta, x_data, y_data, bulge_disk_2D_model)
             self.decomp[1] = [[*output_2.beta], [*output_2.sd_beta]]
-            print(f'Two componenet, BIC: {BIC_2[0]:.2f}, RSS: {BIC_2[1]:.2f}, fitted parameters: {BIC_2[2]}') if verbose else None
-            result = ['single Bulge preferred', 'Bulge + Disk preferred'][np.argmin([BIC_1[0], BIC_2[0]])]
-            print(result) if verbose else None
-        else:
-            print('single Bulge preferred') if verbose else None
+
     
     def bulge_bar_disk_decomp(self, spokes=12, mode=0, verbose=False):
-        disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model = self.fit_functions(spokes)  
+        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes)  
         
         if self.decomp[1][0] != 0:
             self.decomp_data = self.create_data(spokes)
@@ -821,13 +832,10 @@ class BDdecomp:
             odr_3 = ODR(data, Model(bulge_bar_disk_2D_model), beta0=p0_3, maxit=10)
             odr_3.set_job(fit_type=mode)
             output_3 = odr_3.run()
-
-            BIC_3 = self.BIC(output_3.beta, x_data, y_data, bulge_bar_disk_2D_model)
             self.decomp[2] = [output_3.beta, output_3.sd_beta]
-            print(f'Three componenet, BIC: {BIC_3[0]:.2f}, RSS: {BIC_3[1]:.2f}, fitted parameters: {BIC_3[2]}')  if verbose else None
     
     def disk_decomp(self, spokes=12, mode=0, verbose=False):
-        disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model = self.fit_functions(spokes)  
+        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes)  
         self.decomp_data = self.create_data(spokes)
         x_data, y_data, x_err, y_err = self.decomp_data['all']
         data = Data(x_data, y_data, we=1/x_err**2, wd=1/y_err**2)
@@ -842,10 +850,9 @@ class BDdecomp:
 
         BIC_4 = self.BIC(output_0.beta, x_data, y_data, disk_2D_model)
         self.decomp[3] = [output_0.beta, output_0.sd_beta]
-        print(f'Disk, BIC: {BIC_4[0]:.2f}, RSS: {BIC_4[1]:.2f}, fitted parameters: {BIC_4[2]}')  if verbose else None
 
-    def load_main_BD(self, spokes=12):
-        self.decomp_data = self.create_data(spokes)
+    def load_main_BD(self, spokes=12, center=False):
+        self.decomp_data = self.create_data(spokes, center)
         bd_data_1 = df_bd1[df_bd1['sn_name'] == self.name]
         bd_data_2 = df_bd2[df_bd2['sn_name'] == self.name]
         bd_data_3 = df_bd3[df_bd3['sn_name'] == self.name]
@@ -855,115 +862,232 @@ class BDdecomp:
         self.decomp[2] = [[*bd_data_3.values[0][1:18]], [*bd_data_3.values[0][18:]]] if np.any(bd_data_3) else None
         self.decomp[3] = [[*bd_data_4.values[0][1:7]], [*bd_data_4.values[0][7:]]] if np.any(bd_data_4) else None
 
-    def classify_gal(self):
-
-        def BIC(out, x_data, y_data, x_err, y_err, model):
-            pars, pars_err = out
-            n, k = len(x_data), len(pars)
-
-            def mag_check(ue, lim=24):
-                return 0 if ue < lim else ue-lim
-            
-            def col_check(c1, c2, ell=0.1):
-                c1, c2 = np.abs(c1), np.abs(c2)
-                if c1<c2:
-                    return c1-c2
+    def load_pars(self):
+        
+        def get_shape(i):
+            if i == 0:
+                if self.decomp[0][0][0] == 0:
+                    return [0,0,0,0,0,0]
                 else:
-                    return 10 if ell < 0.5 else c1-c2
+                    ue_g_1, ue_r_1, n_1, Re_a_1, Re_b_1, Re_pa_1, Re_n_1 = self.decomp[0][0]
+                    a, b = max(abs(Re_a_1), abs(Re_b_1)), min(abs(Re_a_1), abs(Re_b_1))
+                    return [a, 1-b/a, ue_g_1-ue_r_1, n_1, Re_n_1, Re_pa_1%(np.pi)]
+                  
+            elif i == 1:
+                if self.decomp[1][0][0] == 0:
+                    return [[0,0,0,0,0,0,0], [0,0,0,0,0,0]]
+                else:
+                    ue_g_2, ue_r_2, u0_g_2, u0_r_2, n_2, Re_a_2, Re_b_2, Re_pa_2, Re_n_2, h_a_2, h_b_2, h_pa_2, h_n_2 = self.decomp[1][0]
+                    a1, b1 =  max(abs(Re_a_2), abs(Re_b_2)), min(abs(Re_a_2), abs(Re_b_2))
+                    a2, b2 =  max(abs(h_a_2), abs(h_b_2)), min(abs(h_a_2), abs(h_b_2))
+                    return [[a1, 1-b1/a1, ue_g_2, ue_r_2, n_2, Re_n_2, Re_pa_2%(np.pi)], [a2, 1-b2/a2, u0_g_2, u0_r_2, h_n_2, h_pa_2%(np.pi)]]
 
-            if k == 6:
-                c_disk, re_disk = np.subtract(*pars[:2]), np.sqrt(np.product(self.transform(1, [pars[2:4]], 1)[1]))
-                ue_check = np.sum([mag_check(pars[i], lim=26) for i in range(2)])*10
-                gal_i = (c_disk - 0.7) + ue_check
-            if k == 7:
-                c_bulge, re_bulge = np.subtract(*pars[:2]), np.sqrt(pars[3]*pars[4])
-                ue_check = np.sum([mag_check(pars[i], lim=26) for i in range(2)])*10
-                gal_i = (0.7 - c_bulge) + ue_check
-            elif k == 13:
-                c_bulge, c_disk = np.subtract(*pars[:2]), np.subtract(*pars[2:4])
-                re_bulge = np.sqrt(pars[5]*pars[6])
-                (ue_disk_g, re_disk) = self.transform(pars[2], [pars[9:11]], 1)
-                (ue_disk_r, re_disk) = self.transform(pars[3], [pars[9:11]], 1)
-                re_disk = np.sqrt(np.product(re_disk))
-                disk_ell =  1-min(pars[9], pars[10])/max(pars[9], pars[10])
-                bulge_SE =  pars[8]
-                
-                ue_check_b = np.sum([mag_check(ue_i, lim=24) for ue_i in [pars[0], pars[1]]])*10
-                ue_check_d = np.sum([mag_check(ue_i, lim=24) for ue_i in [ue_disk_g[0], ue_disk_r[0]]])*10
-                gal_i = col_check(c_disk, c_bulge, ell=disk_ell) + ue_check_b + ue_check_d + (re_bulge>re_disk)*10 #+ (bulge_SE<1.2)*10
-            elif k == 17:
-                c_bulge, c_bar, c_disk = np.subtract(*pars[:2]), np.subtract(*pars[2:4]), np.subtract(*pars[4:6])
-                (ue_disk_g, re_disk) = self.transform(pars[4], [pars[13:15]], 1)
-                (ue_disk_r, re_disk) = self.transform(pars[5], [pars[13:15]], 1)
-                re_bulge, re_disk, re_bar = pars[8], np.sqrt(np.product(re_disk)), max(pars[9], pars[10])
-                disk_ell =  1-min(pars[13], pars[14])/max(pars[13], pars[14])
+            elif i == 2:
+                if self.decomp[2][0][0] == 0:
+                    return [[0,0,0,0], [0,0,0,0,0,0], [0,0,0,0,0,0,0]]
+                else:
+                    ue_g_bul_3, ue_r_bul_3, ue_g_bar_3, ue_r_bar_3, u0_g_3, u0_r_3, n_bul_3, n_bar_3, Re_bul_3, Re_a_3, Re_b_3, Re_pa_3, Re_n_3, h_a_3, h_b_3, h_pa_3, h_n_3 = self.decomp[2][0]
+                    a1, b1 =  max(abs(Re_a_3), abs(Re_b_3)), min(abs(Re_a_3), abs(Re_b_3))
+                    a2, b2 =  max(abs(h_a_3), abs(h_b_3)), min(abs(h_a_3), abs(h_b_3))
+                    return [[Re_bul_3, ue_g_bul_3, ue_r_bul_3, n_bul_3], [a2, 1-b2/a2, u0_g_3, u0_r_3, h_n_3, h_pa_3%(np.pi)], [a1, 1-b1/a1, ue_g_bar_3, ue_r_bar_3, n_bar_3, Re_n_3, Re_pa_3%(np.pi)]]
+            
+            elif i == 3:
+                if self.decomp[3][0][0] == 0:
+                    return [0,0,0,0,0]
+                else:
+                    ue_g_4, ue_r_4, h_a_4, h_b_4, h_pa_4, h_n_4 = self.decomp[3][0]
+                    a, b =  max(abs(h_a_4), abs(h_b_4)), min(abs(h_a_4), abs(h_b_4))
+                    return [a, 1-b/a, ue_g_4-ue_r_4, h_n_4, h_pa_4%(np.pi)]
 
-                bar_sersic, bar_SE, bar_ecc = pars[7], pars[12], 1-min(pars[9], pars[10])/max(pars[9], pars[10])
-                ue_check_b = np.sum([mag_check(ue_i, lim=24) for ue_i in [pars[0], pars[1], pars[2], pars[3]]])*10
-                ue_check_d = np.sum([mag_check(ue_i, lim=24) for ue_i in [ue_disk_g[0], ue_disk_r[0]]])*10
-                bar_check = 0.4 - bar_ecc if bar_ecc > 0.3 else 10
-                gal_i = col_check(c_disk, c_bulge, ell=1) + (2-min(bar_SE, 3)) + (bar_sersic>1)*10 + bar_check + ue_check_b + ue_check_d + (re_bulge>re_disk)*10  + (re_bulge>re_bar)*10 + (disk_ell>0.4)*10
-
-            rss_d = rss_save[rss_save['sn_name'] == self.name]
-            if np.any(rss_d):
-                ind_ = np.where(np.array([7, 13, 17, 6])==k)[0][0]
-                WSS = rss_d.values[0][5+ind_]
-            else:
-                # RSS = np.sum((model(pars, x_data) - y_data)**2)
-                WSS = np.sum((model(pars, x_data) - y_data)**2/(x_err/x_err.mean()))
-            RSS_lim = max(WSS/n, y_err.mean()/3)
-            BIC_i = n * np.log(RSS_lim) + k * np.log(n)
-            return BIC_i + n*gal_i, (WSS/n)/y_err.mean()
  
-        disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model = self.fit_functions(spokes=12)
+        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes=12)
         x_data, y_data, x_err, y_err = self.decomp_data['all']
+
+        def RSS(out, model):
+            return np.sum((model(out, x_data) - y_data)**2) / len(x_data)
+
+        RSS_1 = RSS(self.decomp[0][0],  bulge_2D_model) if (self.decomp[0][0][0] != 0) else 1
+        RSS_2 = RSS(self.decomp[1][0],  bulge_disk_2D_model) if (self.decomp[1][0][0] != 0) else 1
+        RSS_3 = RSS(self.decomp[2][0],  bulge_bar_disk_2D_model) if (self.decomp[2][0][0] != 0) else 1
+        RSS_4 = RSS(self.decomp[3][0],  disk_2D_model) if (self.decomp[3][0][0] != 0) else 1
+
+        RSS_arr = [RSS_1, RSS_2, RSS_3, RSS_4]
+        err_mean = [x_err.mean(), y_err.mean()]
+        n_iso = [self.iso_data['g'].shape[1], self.iso_data['r'].shape[1]]
+
+        fit_0 = get_shape(0)
+        fit_1 = get_shape(1)
+        fit_2 = get_shape(2)
+        fit_3 = get_shape(3)
+
+        return [self.name, *RSS_arr, *err_mean, *fit_0, *fit_1[0], *fit_1[1], *fit_2[0], *fit_2[1], *fit_2[2], *fit_3, x_data.min(), x_data.max(), y_data.min(), y_data.max(), *n_iso]
+
+    @staticmethod
+    def bd_ratio(ue, u0, n, Re, h):
+        b = 1.9992*n - 0.3271
+        Ie, I0 = 10**(-0.4*ue), 10**(-0.4*u0)
+        return n*gamma(2*n)*np.exp(b)/b**(2*n) * (Re/h)**2 * (Ie/I0)
+    
+    @staticmethod
+    def bb_ratio(ue1, ue2, n1, n2, Re1, Re2):
+        Ie1, Ie2 = 10**(-0.4*ue1), 10**(-0.4*ue2)
+        return gamma(2*n1 + 1)/gamma(2*n2 + 1) * (Re1/Re2)**2 * (Ie1/Ie2)
+
+    def classify_gal(self, verbose=False):
+        keys = ['sn_name','RSS_0','RSS_1','RSS_2','RSS_3','xerr','yerr',   'a_0','e_0','c_0','n_0','se_0','pa_0',
+                'a1_1','e1_1','ug1_1','ur1_1','n_1','se1_1','pa1_1',    'a2_1','e2_1','ug2_1','ur2_1','se2_1','pa2_1',
+                'a1_2','ug1_2','ur1_2','n1_2',    'a2_2','e2_2','ug2_2','ur2_2','se2_2','pa2_2',    'a3_2','e3_2','ug3_2','ur3_2','n3_2','se3_2','pa3_2',
+                'a_3','e_3','c_3','se_3','pa_3',    'x_min','x_max','y_min','y_max','n_iso_g','n_iso_r']
+        df_g = pd.DataFrame(columns=keys)
+        df_g.loc[0] = self.load_pars()
+        galaxy_possible = ['bulge', 'bulge+disk', 'bulge+bar+disk', 'disk']
+
+        z = self.gobj['g'].gal['z']
+        self.kcorr = {'Ell': K_corr(z=z, template=df_E), 'Bulge': K_corr(z=z, template=df_E), 'S0': K_corr(z=z, template=df_s0),
+                      'Sab': K_corr(z=z, template=df_sab), 'Sc': K_corr(z=z, template=df_sc)}
         
-        BIC_1, gal_w_1 = BIC(self.decomp[0], x_data, y_data, x_err, y_err, bulge_2D_model) if self.decomp[0][0][0] != 0 else [9999, 9999]
-        BIC_2, gal_w_2 = BIC(self.decomp[1], x_data, y_data, x_err, y_err, bulge_disk_2D_model) if self.decomp[1][0][0] != 0 else [10000, 10000]
-        BIC_3, gal_w_3 = BIC(self.decomp[2], x_data, y_data, x_err, y_err, bulge_bar_disk_2D_model) if self.decomp[2][0][0] != 0 else [10001, 10001]
-        BIC_4, gal_w_4 = BIC(self.decomp[3], x_data, y_data, x_err, y_err, disk_2D_model) if self.decomp[3][0][0] != 0 else [10002, 10002]
+        def rss_check(labels):
+            for i, gal_type in enumerate(['bulge', 'bulge+disk', 'bulge+bar+disk', 'disk']):
+                rss_lim = 0.025 if i!=3 else 0.03
+                if (gal_type in labels) and (df_g[f'RSS_{i}'].values > rss_lim):
+                    labels.remove(gal_type)
+            return labels
 
-        BIC_arr = [BIC_1, BIC_2, BIC_3, BIC_4]
-        RSS_arr = [gal_w_1, gal_w_2, gal_w_3, gal_w_4]
-        gal_1i, gal_2i = np.argpartition(BIC_arr, 2)[:2]
-        galaxy_type = ['Bulge', 'Bulge+Disk', 'Bulge+Bar+Disk', 'Disk']
-        g1, g2 = galaxy_type[gal_1i], galaxy_type[gal_2i]
-
-        if (np.max(self.decomp_data['g'][1]) < 23) or ( np.max(self.decomp_data['r'][1]) < 23):
-            g1, g2 = 'too-close', galaxy_type[gal_1i]
-
-        if gal_1i == 0:
-            ue_g, ue_r, n, Re_a, Re_b, Re_pa, Re_n = self.decomp[0][0]
-            gal_ecc, gal_se =  1-min(Re_b, Re_a)/max(Re_b, Re_a), Re_n
-            if (gal_ecc > 0.5) and (gal_se < 1.6):
-                g1, g2 = 'edge-on-disk', 'bulge'
-        elif gal_1i == 3:
-            ue_g, ue_r, Re_a, Re_b, Re_pa, Re_n = self.decomp[3][0]
-            gal_ecc, gal_se =  1-min(Re_b, Re_a)/max(Re_b, Re_a), Re_n
-            if (gal_ecc > 0.5) and (gal_se < 1.6):
-                g1, g2 = 'edge-on-disk', 'disk'
+        def elliptical_check(labels, ell, col, SE_n):
+            col_k = col - np.subtract(*self.kcorr['Ell'])
+            condition = (ell < 0.7) and (col_k > 0.5) and (col_k < 2) and (SE_n > 1.8) and (SE_n < 2.2) and (self.decomp[0][0] != 0) 
+            if not condition:
+                labels.remove('bulge')
+            return labels
         
-        if np.abs(BIC_arr[gal_1i] - BIC_arr[gal_2i]) < 100:
-            g2 = 'unclear'
+        def disk_check(labels, ell, col, SE_n):
+            col_k = col - np.subtract(*self.kcorr['Sab'])
+            self.d_corr = get_corrections(ell, 1, trad=10, tau=0.5)
+            condition = (ell < 0.6) and (col_k > 0) and (col_k < 0.5) and (SE_n > 1) and (SE_n < 3) and (self.decomp[3][0] != 0) 
+            if not condition:
+                labels.remove('disk')
+            return labels
         
-        self.bd_gal = {'type': g1, 'BIC': BIC_arr[gal_1i], 'type_2': g2,  'BIC_2': BIC_arr[gal_2i], 'RSS_r': RSS_arr[gal_1i]}
+        def disk_subtype(BD_color, BD_ratio):
+            print(np.round(BD_color, 3), np.round(BD_ratio, 3)) if verbose else None
+            if (BD_color > 0) & (BD_color < 0.1) & (BD_ratio > 0.15) & (BD_ratio < 0.6):
+                return 'S0'
+            elif (BD_color >= 0.1) & (BD_color < 0.45) & (BD_ratio > 0.01) & (BD_ratio < 0.5):
+                return 'Sab'
+            elif (BD_color >= 0.45) & (BD_color < 1.6) & (BD_ratio > 0.001) & (BD_ratio < 0.15):
+                return 'Sc'
+            else:
+                return 'none'
+        
+        def bulge_disk_check(labels, bulge_pars, disk_pars):
+            Re, b_ell, b_ug, b_ur, b_n, b_SE = bulge_pars
+            h, d_ell, d_ug, d_ur, d_SE = disk_pars
 
+            if self.decomp[1][0] == 0:
+                labels.remove('bulge+disk')
+                return labels
+
+            corrs = get_corrections(d_ell, b_n, trad=10, tau=0.5)
+            h_corr = corrs['disk_proj'][0] * corrs['disk_dust'][0]
+            u0g_corr = corrs['disk_proj'][1] + corrs['disk_dust'][1]
+            u0r_corr = corrs['disk_proj'][1] + corrs['disk_dust'][2]
+            Re_corr = corrs['bulge_proj'][0] * corrs['bulge_dust'][0]
+            n_corr = corrs['bulge_proj'][1] + corrs['bulge_dust'][1]
+            self.bd_corr = corrs
+
+            BD_g = self.bd_ratio(b_ug, d_ug-u0g_corr, b_n-n_corr, Re/Re_corr, h/h_corr)
+            b_col, d_col = b_ug-b_ur, d_ug-d_ur
+            kcorr_type = disk_subtype(BD_color=b_col-d_col, BD_ratio=BD_g)
+            self.b_sub_type = kcorr_type
+            if kcorr_type == 'none':
+                labels.remove('bulge+disk')
+                return labels
+            
+            kcorr_bulge, kcorr_disk = self.kcorr['Bulge'], self.kcorr[kcorr_type]
+            b_kcol = b_col-np.subtract(*kcorr_bulge)
+            d_kcol = d_col-np.subtract(*kcorr_disk)
+
+            bulge_condition = (b_ell < 0.6) and (b_kcol > 0.6) & (b_kcol < 2.1) and (b_SE > 1.5) and (b_SE < 2.5)
+            disk_condition = (d_ell < 0.6) and (d_kcol > 0) and (d_kcol < 0.8) and (d_SE > 1.5) and (d_SE < 2.5)
+            condition = bulge_condition and disk_condition
+            if not condition:
+                labels.remove('bulge+disk')
+            return labels
+        
+        def bulge_bar_disk_check(labels, bulge_pars, disk_pars, bar_pars):
+            Re_bulge, bulge_ug, bulge_ur, bulge_n = bulge_pars
+            h, d_ell, d_ug, d_ur, d_SE = disk_pars
+            Re_bar, bar_ug, bar_ur, bar_n, bar_SE = bar_pars
+            
+            if self.decomp[2][0] == 0:
+                labels.remove('bulge+bar+disk')
+                return labels
+
+            corrs = get_corrections(d_ell, bulge_n, trad=10, tau=0.5)
+            h_corr = corrs['disk_proj'][0] * corrs['disk_dust'][0]
+            u0g_corr = corrs['disk_proj'][1] + corrs['disk_dust'][1]
+            u0r_corr = corrs['disk_proj'][1] + corrs['disk_dust'][2]
+            Re_corr = corrs['bulge_proj'][0] * corrs['bulge_dust'][0]
+            n_corr = corrs['bulge_proj'][1] + corrs['bulge_dust'][1]
+            self.bbd_corr = corrs
+
+            BD_g = self.bd_ratio(bulge_ug, d_ug-u0g_corr, bulge_n-n_corr, Re_bulge/Re_corr, h/h_corr)
+            bulge_col, bar_col, d_col = bulge_ug-bulge_ur, bar_ug-bar_ur, d_ug-d_ur
+            kcorr_type = disk_subtype(BD_color=bulge_col-d_col, BD_ratio=BD_g)
+            self.bb_sub_type = kcorr_type
+            if kcorr_type == 'none':
+                labels.remove('bulge+bar+disk')
+                return labels
+            
+            kcorr_bulge_bar, kcorr_disk = self.kcorr['Bulge'], self.kcorr[kcorr_type]
+            bulge_kcol = bulge_col-np.subtract(*kcorr_bulge_bar)
+            bar_kcol = bar_col-np.subtract(*kcorr_bulge_bar)
+            d_kcol = d_col-np.subtract(*kcorr_disk)
+
+            b_bulge = 1.9992*bulge_n - 0.3271
+            b_bar = 1.9992*bar_n - 0.3271
+            u0_bulge = bulge_ug - 2.5*b_bulge/np.log(10)
+            u0_bar = bar_ug - 2.5*b_bar/np.log(10)
+
+            bulge_condition = (bulge_kcol > 0.6) and (bulge_kcol < 2.1) and (u0_bulge < u0_bar) and (Re_bulge < Re_bar)
+            bar_condition = (bar_n < 0.75) and (bar_kcol > d_kcol-0.1) and (bar_kcol < bulge_kcol+0.5) and (bar_SE > 1) and (bar_SE < 6)
+            disk_condition = (d_ell < 0.6) and (d_kcol > 0) and (d_kcol < 0.85) and (d_SE > 1.5) and (d_SE < 2.5)
+            condition = bulge_condition and bar_condition and disk_condition
+            if not condition:
+                labels.remove('bulge+bar+disk')
+            return labels
+
+
+        galaxy_possible = elliptical_check(galaxy_possible, *df_g[['e_0', 'c_0', 'se_0']].values[0])
+        print(galaxy_possible) if verbose else None
+        galaxy_possible = disk_check(galaxy_possible, *df_g[['e_3', 'c_3', 'se_3']].values[0])
+        print(galaxy_possible) if verbose else None
+        galaxy_possible = bulge_disk_check(galaxy_possible, df_g[['a1_1', 'e1_1', 'ug1_1', 'ur1_1', 'n_1','se1_1']].values[0], df_g[['a2_1','e2_1','ug2_1','ur2_1','se2_1']].values[0])
+        print(galaxy_possible) if verbose else None
+        galaxy_possible = bulge_bar_disk_check(galaxy_possible, df_g[['a1_2','ug1_2','ur1_2','n1_2',]].values[0], df_g[['a2_2','e2_2','ug2_2','ur2_2','se2_2']].values[0], df_g[['a3_2','ug3_2','ur3_2','n3_2','se3_2']].values[0])
+        print(galaxy_possible) if verbose else None
+        galaxy_rss_cut = rss_check(galaxy_possible.copy())
+        print(galaxy_rss_cut) if verbose else None
+        
+        if len(galaxy_possible) == 0:
+            return 'unclear'
+        elif len(galaxy_possible) > 0:
+            if (len(galaxy_rss_cut) == 0) or (abs(df_g['n_iso_g'].values[0]-df_g['n_iso_r'].values[0]) > 10):
+                return 'bad_fit'
+            elif len(galaxy_rss_cut) == 1:
+                return galaxy_rss_cut[0]
+            else:
+                if 'bulge' in galaxy_rss_cut:
+                    return 'E-S0'
+                elif 'disk' in galaxy_rss_cut:
+                    return 'bulge+disk'
+                else:
+                    return 'bulge+bar+disk'
 
 
     def galaxy_pars(self):
-        self.classify_gal()
-        galaxy_type = self.bd_gal['type']
-        if galaxy_type == 'edge-on-disk':
-            gal_i = 3 if self.bd_gal['type_2'] == 'disk' else 0
-        elif galaxy_type == 'too-close':
-            gal_i = 0
-        else:
-            gal_i = np.where(np.array(['Bulge', 'Bulge+Disk', 'Bulge+Bar+Disk', 'Disk']) == galaxy_type)[0][0]
-        
-        if self.bd_gal['type_2'] == 'unclear':
-            galaxy_type += '_u'
-        rss_fit = self.bd_gal['RSS_r']
-        n_fits = f'{int(self.decomp[0][0][0] != 0)}{int(self.decomp[1][0][0] != 0)}{int(self.decomp[2][0][0] != 0)}{int(self.decomp[3][0][0] != 0)}'
+        galaxy_type = self.classify_gal()
+        gal_i = np.where(np.array(['Bulge', 'Bulge+Disk', 'Bulge+Bar+Disk', 'Disk', 'E-S0', 'unclear', 'bad_fit']) == galaxy_type)[0][0]
 
         z = self.gobj['g'].gal['z']
         wcs = self.gobj['g'].cutout['wcs']
@@ -975,68 +1099,69 @@ class BDdecomp:
         sn_deg = np.array([sn_loc.ra.deg, sn_loc.dec.deg])
         host_deg = np.array([host_center.ra.deg, host_center.dec.deg])
         sn_vec = sn_deg - host_deg
-        theta = np.arctan(sn_vec[1]/sn_vec[0])
+        theta = np.pi - np.arctan(sn_vec[1]/sn_vec[0])
 
-        model_i = gal_i+1 if gal_i!=3 else 0
-        sn_local_g = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='combine', n_model=model_i, px=False)
-        sn_local_r = self.SB_profile(separation*arcsec2kpc, theta, band='r', model='combine', n_model=model_i, px=False)
-        SB_center_g = self.SB_profile(0, 0, band='g', model='combine', n_model=model_i, px=False)
-        SB_center_r = self.SB_profile(0, 0, band='r', model='combine', n_model=model_i, px=False)
-        try:
-            R25_g = self.SB_isophote(25, 'g', n_model=model_i, model='combine')[0][0]*0.262/arcsec2kpc
-            R25_r = self.SB_isophote(25, 'r', n_model=model_i, model='combine')[0][0]*0.262/arcsec2kpc
-            R26p5_g = self.SB_isophote(26.5, 'g', n_model=model_i, model='combine')[0][0]*0.262/arcsec2kpc
-            R26p5_r = self.SB_isophote(26.5, 'r', n_model=model_i, model='combine')[0][0]*0.262/arcsec2kpc
-        except RuntimeError:
-            R25_g, R25_r, R26p5_g, R26p5_r = np.zeros(4)
+        if gal_i < 4:
+            model_i = gal_i+1 if gal_i!=3 else 0
+            sn_local_g = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='combine', n_model=model_i, px=False, corr=True)
+            sn_local_r = self.SB_profile(separation*arcsec2kpc, theta, band='r', model='combine', n_model=model_i, px=False, corr=True)
+            try:
+                R25_g = self.SB_isophote(25, 'g', n_model=model_i, model='combine', corr=True)[0][0]*0.262/arcsec2kpc
+                R25_r = self.SB_isophote(25, 'r', n_model=model_i, model='combine', corr=True)[0][0]*0.262/arcsec2kpc
+            except RuntimeError:
+                R25_g, R25_r = 0, 0
+        else:
+            sn_local_g, sn_local_r, R25_g, R25_r = 0, 0, 0, 0
 
         fit_data, fit_errs = self.decomp[gal_i]
         if gal_i == 0 :
             ue_g, ue_r, n, Re_a, Re_b, Re_pa, Re_n = fit_data
-            Re_a, Re_b = max(Re_a, Re_b), min(Re_a, Re_b)
+            Re_a, Re_b = max(abs(Re_a), abs(Re_b)), min(abs(Re_a), abs(Re_b))
             gal_pa, gal_ecc, gal_se = Re_pa % (np.pi), 1-Re_b/Re_a, Re_n
             sn_component = 'elliptical'
             sersic_n = n
-            bd_ratio = 1
+            bd_g, bb_g = 0, 0
             
         elif gal_i == 1:
             ue_g, ue_r, u0_g, u0_r, n, Re_a, Re_b, Re_pa, Re_n, h_a, h_b, h_pa, h_n = fit_data
-            Re_a, Re_b = max(Re_a, Re_b), min(Re_a, Re_b)
-            h_a, h_b = max(h_a, h_b), min(h_a, h_b)
+            Re_a, Re_b = max(abs(Re_a), abs(Re_b)), min(abs(Re_a), abs(Re_b))
+            h_a, h_b = max(abs(h_a), abs(h_b)), min(abs(h_a), abs(h_b))
             gal_pa, gal_ecc, gal_se = h_pa % (np.pi), 1-h_b/h_a, h_n
-            sn_bulge = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='bulge', n_model=gal_i+1, px=False)
-            sn_disk = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='disk', n_model=gal_i+1, px=False)
+            sn_bulge = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='bulge', n_model=gal_i+1, px=False, corr=True)
+            sn_disk = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='disk', n_model=gal_i+1, px=False, corr=True)
             if (sn_bulge - sn_disk < 1):
                 sn_component = 'bulge' 
             else:
                 sn_component = 'disk' 
             sersic_n = n
-            bd_ratio = Re_a/h_a
+            bd_g, bb_g = self.bd_ratio(ue_g, u0_g, n, Re_a, h_a), 0
 
         elif gal_i == 2:
             ue_bulge_g, ue_bulge_r, ue_bar_g, ue_bar_r, u0_g, u0_r, n_bulge, n_bar, Re_bulge, Re_bar_a, Re_bar_b, Re_bar_pa, Re_bar_n, h_a, h_b, h_pa, h_n = fit_data
-            h_a, h_b = max(h_a, h_b), min(h_a, h_b)
+            Re_bar_a, Re_bar_b = max(abs(Re_bar_a), abs(Re_bar_b)), min(abs(Re_bar_a), abs(Re_bar_b))
+            h_a, h_b = max(abs(h_a), abs(h_b)), min(abs(h_a), abs(h_b))
             gal_pa, gal_ecc, gal_se = h_pa % (np.pi), 1-h_b/h_a, h_n
-            sn_bulge = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='bulge', n_model=gal_i+1, px=False)
-            sn_bar = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='bar', n_model=gal_i+1, px=False)
-            sn_disk = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='disk', n_model=gal_i+1, px=False)
             sersic_n = n_bulge
+
+            sn_bulge = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='bulge', n_model=gal_i+1, px=False, corr=True)
+            sn_bar = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='bar', n_model=gal_i+1, px=False, corr=True)
+            sn_disk = self.SB_profile(separation*arcsec2kpc, theta, band='g', model='disk', n_model=gal_i+1, px=False, corr=True)
             if (sn_bar < sn_bulge) & (sn_bar < sn_disk):
                 sn_component = 'bar'
             elif (sn_bulge - sn_disk < 1):
                 sn_component = 'bulge' 
             else:
                 sn_component = 'disk'
-            bd_ratio = Re_bulge/h_a
+
+            bd_g = self.bd_ratio(ue_bulge_g, u0_g, n_bulge, Re_bulge, h_a)
+            bb_g = self.bb_ratio(ue_bulge_g, ue_bar_g, n_bulge, n_bar, Re_bulge, Re_bar_a * np.sqrt(Re_bar_b/Re_bar_a))
 
         if gal_i == 3:
             ue_g, ue_r, h_a, h_b, h_pa, h_n = fit_data
-            h_a, h_b = max(h_a, h_b), min(h_a, h_b)
+            h_a, h_b = max(abs(h_a), abs(h_b)), min(abs(h_a), abs(h_b))
             gal_pa, gal_ecc, gal_se = h_pa % (np.pi), 1-h_b/h_a, h_n
-            sn_component = 'disk_nb'
-            sersic_n = 1
-            x_data = self.decomp_data['all'][0]
-            bd_ratio = x_data.min()/h_a
+            sn_component = 'disk'
+            bd_g, bb_g = 0, 0
         
         rotation_matrix = np.array([[np.cos(gal_pa), np.sin(gal_pa)], [-np.sin(gal_pa), np.cos(gal_pa)]])
         sn_radial, sn_height = (rotation_matrix @ (sn_deg - host_deg)) * 3600/arcsec2kpc
@@ -1051,8 +1176,9 @@ class BDdecomp:
         else:
             gp_pars, gp_errs = np.zeros(9), np.zeros(8)
 
-        self.galaxy = [self.name, z, *sn_deg, *host_deg, galaxy_type, gal_pa, gal_ecc, gal_se, separation, sersic_n, SB_center_g, SB_center_r, sn_radial, sn_height, sn_component, sn_local_g, sn_local_r, 
-                       R25_g, R25_r, R26p5_g, R26p5_r, n_fits, rss_fit, bd_ratio, x1_salt, c_salt, sntype, abs_g_salt, abs_r_salt, lc_flag, *gp_pars, *gp_errs]
+        self.galaxy = [self.name, z, *sn_deg, *host_deg, galaxy_type, gal_pa, gal_ecc, gal_se, separation, sersic_n, sn_radial, sn_height, sn_component, sn_local_g, sn_local_r, 
+                       R25_g, R25_r,  bd_ratio, x1_salt, c_salt, sntype, abs_g_salt, abs_r_salt, lc_flag, *gp_pars, *gp_errs]
+
 
     def plot_func(self):
         xm, ym, rm, thetam = self.get_meshgrid()
@@ -1129,6 +1255,17 @@ class BDdecomp:
         rp = [3, 5, 9, 2][n_model-1]
         disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model = self.plot_func()  
         fig, axis = plt.subplots(figsize=(18, 10), ncols=2, nrows=3, dpi=100)
+
+        z = self.gobj['g'].gal['z']
+        wcs = self.gobj['g'].cutout['wcs']
+        sn_loc = SkyCoord(*self.gobj['g'].gal['sn'], unit='deg')
+        host_center = wcs.pixel_to_world(*self.center)
+        separation = host_center.separation(sn_loc).arcsec
+        sn_deg = np.array([sn_loc.ra.deg, sn_loc.dec.deg])
+        host_deg = np.array([host_center.ra.deg, host_center.dec.deg])
+        sn_vec = sn_deg - host_deg
+        theta_sn = np.arctan(sn_vec[1]/sn_vec[0])
+
         
         for i in range(6):
             band = 'g' if i%2 == 0 else 'r'
@@ -1140,6 +1277,7 @@ class BDdecomp:
             ax.errorbar(x_data[i], y_data[i],yerr=sigma*y_err[i], xerr=sigma*x_err[i], fmt='k.', zorder=0, label=fr'{sigma} sigma,  $\theta =${theta[i]:.0f}$^\circ$')
             ax.set_ylim([y_data.min()-0.5, 25.5])
             ax.invert_yaxis()
+            ax.axvline(separation, color='k', label=f'SN {np.rad2deg(theta_sn) % (360):.2f} deg')
 
         x_ax = np.linspace(0, x_data.max()+1, 100)
         if n_model == 3:
@@ -1199,16 +1337,38 @@ class BDdecomp:
 
         plt.tight_layout()
 
-    def SB_profile(self, r, theta, band, model='all', n_model=2, px=True):
+    def SB_profile(self, r, theta, band, model='all', n_model=2, px=True, corr=False):
         rp = [3, 5, 9, 2][n_model-1]
         arcsec2px = np.array([0.262, 0.262, 1, 1]) if px else np.ones(4)
         if n_model == 3:
             ue_bulge_g, ue_bulge_r, ue_bar_g, ue_bar_r, u0_g, u0_r, n_bulge, n_bar, Re_bulge = self.decomp[n_model-1][0][:rp]
+            Re_bar = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp:rp+4]/arcsec2px)
+            h_disk = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp+4:rp+8]/arcsec2px)
+
+            if corr:
+                kcorr_bulge_bar, kcorr_disk = self.kcorr['Bulge'], self.kcorr[self.bb_sub_type]
+                corrs = self.bbd_corr
+                h_corr = corrs['disk_proj'][0] * corrs['disk_dust'][0]
+                u0g_corr = corrs['disk_proj'][1] + corrs['disk_dust'][1]
+                u0r_corr = corrs['disk_proj'][1] + corrs['disk_dust'][2]
+                Re_corr = corrs['bulge_proj'][0] * corrs['bulge_dust'][0]
+                n_corr = corrs['bulge_proj'][1] + corrs['bulge_dust'][1]
+
+                ue_bulge_g -= kcorr_bulge_bar[0]
+                ue_bulge_r -= kcorr_bulge_bar[1]
+                ue_bar_g -= kcorr_bulge_bar[0]
+                ue_bar_r -= kcorr_bulge_bar[1]
+                u0_g -= (kcorr_disk[0]+u0g_corr)
+                u0_r -= (kcorr_disk[1]+u0r_corr)
+                h_disk /= h_corr
+                Re_bulge /= Re_corr
+                Re_bar /= Re_corr
+                n_bulge -= n_corr
+
             ue_bulge = {'g': ue_bulge_g, 'r': ue_bulge_r}[band]
             ue_bar = {'g': ue_bar_g, 'r': ue_bar_r}[band]
             u0_disk = {'g': u0_g, 'r': u0_r}[band]
-            Re_bar = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp:rp+4]/arcsec2px)
-            h_disk = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp+4:rp+8]/arcsec2px)
+            
             div = 0.262 if px else 1
             if model == 'bulge':
                 return self.bulge(r, ue_bulge, Re_bulge/div, n_bulge)
@@ -1221,10 +1381,29 @@ class BDdecomp:
             
         elif n_model == 2:
             ue_g, ue_r, u0_g, u0_r, n_sersic = self.decomp[n_model-1][0][:rp]
-            ue_bulge = {'g': ue_g, 'r': ue_r}[band]
-            u0_disk = {'g': u0_g, 'r': u0_r}[band]
+            
             Re_bulge = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp:rp+4]/arcsec2px)
             h_disk = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp+4:rp+8]/arcsec2px)
+            if corr:
+                kcorr_bulge, kcorr_disk = self.kcorr['Bulge'], self.kcorr[self.b_sub_type]
+                corrs = self.bd_corr
+                h_corr = corrs['disk_proj'][0] * corrs['disk_dust'][0]
+                u0g_corr = corrs['disk_proj'][1] + corrs['disk_dust'][1]
+                u0r_corr = corrs['disk_proj'][1] + corrs['disk_dust'][2]
+                Re_corr = corrs['bulge_proj'][0] * corrs['bulge_dust'][0]
+                n_corr = corrs['bulge_proj'][1] + corrs['bulge_dust'][1]
+
+                ue_g -= kcorr_bulge[0]
+                ue_r -= kcorr_bulge[1]
+                u0_g -= (kcorr_disk[0]+u0g_corr)
+                u0_r -= (kcorr_disk[1]+u0r_corr)
+                h_disk /= h_corr
+                Re_bulge /= Re_corr
+                n_sersic -= n_corr
+            
+            ue_bulge = {'g': ue_g, 'r': ue_r}[band]
+            u0_disk = {'g': u0_g, 'r': u0_r}[band]
+
             if model == 'bulge':
                 return self.bulge(r, ue_bulge, Re_bulge, n_sersic)
             elif model == 'disk':
@@ -1234,37 +1413,53 @@ class BDdecomp:
             
         elif n_model == 1:
             ue_g, ue_r, n_sersic = self.decomp[n_model-1][0][:rp]
+            if corr:
+                kcorr = self.kcorr['Ell']
+                ue_g -= kcorr[0]
+                ue_r -= kcorr[1]
+
             ue_bulge = {'g': ue_g, 'r': ue_r}[band]
             Re_bulge = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp:rp+4]/arcsec2px)
             return self.bulge(r, ue_bulge, Re_bulge, n_sersic)
         
         elif n_model == 0:
             u0_g, u0_r = self.decomp[n_model-1][0][:rp]
-            u0_disk = {'g': u0_g, 'r': u0_r}[band]
             h_disk = self.super_ellipse(theta, *self.decomp[n_model-1][0][rp:rp+4]/arcsec2px)
+            if corr:
+                kcorr = self.kcorr['Sab']
+                corrs = self.d_corr
+                h_corr = corrs['disk_proj'][0] * corrs['disk_dust'][0]
+                u0g_corr = corrs['disk_proj'][1] + corrs['disk_dust'][1]
+                u0r_corr = corrs['disk_proj'][1] + corrs['disk_dust'][2]
+
+                u0_g -= (kcorr[0]+u0g_corr)
+                u0_r -= (kcorr[1]+u0r_corr)
+                h_disk /= h_corr
+ 
+            u0_disk = {'g': u0_g, 'r': u0_r}[band]
             return self.disk(r, u0_disk, h_disk)
         
     
-    def SB_isophote(self, isophote, band, n_model, model='both'): 
+    def SB_isophote(self, isophote, band, n_model, model='both', corr=False): 
         def radial(isophote, theta):
-            sb_profile = lambda r: self.SB_profile(r, theta, band=band, n_model=n_model, model=model) - isophote
+            sb_profile = lambda r: self.SB_profile(r, theta, band=band, n_model=n_model, model=model, corr=corr) - isophote
             return fsolve(sb_profile, 1)
 
         theta = np.linspace(0, 2*np.pi, 50)
         r = np.vectorize(radial)(isophote, theta)
 
         out_pars = curve_fit(self.super_ellipse, theta, r, p0=[r.max()+0.1, r.min()-0.1, self.iso_stat['pa'],  2], maxfev=5000)
-        check = np.mean(self.SB_profile(r, theta, band=band, n_model=n_model, model=model)) - isophote
+        check = np.mean(self.SB_profile(r, theta, band=band, n_model=n_model, model=model, corr=corr)) - isophote
         a, b, pa, n = out_pars[0]
         return [[max(a, b), min(a, b), pa, n], np.sqrt(np.diag(out_pars[1])), np.round(check, 3)] 
 
-    def plot_SB_profile(self, band, isophote=False, subtarct=False, n_model=2):
+    def plot_SB_profile(self, band, isophote=False, subtract=False, n_model=2, corr=False):
         xm, ym, rm, thetam = self.get_meshgrid()
 
-        bulge_arr = self.SB_profile(rm, thetam, model='bulge', n_model=n_model, band=band)
-        bar_arr = self.SB_profile(rm, thetam, model='bar', n_model=n_model, band=band)
-        disk_arr = self.SB_profile(rm, thetam, model='disk', n_model=n_model, band=band)
-        both_arr = self.SB_profile(rm, thetam, model='all', n_model=n_model, band=band)
+        bulge_arr = self.SB_profile(rm, thetam, model='bulge', n_model=n_model, band=band,  corr=corr)
+        bar_arr = self.SB_profile(rm, thetam, model='bar', n_model=n_model, band=band, corr=corr)
+        disk_arr = self.SB_profile(rm, thetam, model='disk', n_model=n_model, band=band, corr=corr)
+        both_arr = self.SB_profile(rm, thetam, model='all', n_model=n_model, band=band, corr=corr)
 
         std = self.gobj[band].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
         kernal = Gaussian2DKernel(x_stddev=std, y_stddev=std)
@@ -1272,7 +1467,7 @@ class BDdecomp:
 
         reds, greens, blues = self.alpha_colormap()
 
-        if not subtarct:
+        if not subtract:
             fig, ax = self.gobj[band].plot()
             rp = [3, 5, 9, 0][n_model-1]
             arcsec2px = np.array([0.262, 0.262, 1, 1])
@@ -1322,24 +1517,82 @@ class BDdecomp:
 
             ax.legend(framealpha=1, fontsize=7, loc=1)
 
-        if subtarct:
+        if subtract:
             def sub_mag(m1, m2):
                 return -2.5*np.log10(np.abs(10**(-0.4*m1) - 10**(-0.4*m2)))
     
             fig, (ax1, ax2, ax3) = plt.subplots(figsize=(18, 6), ncols=3, dpi=100)
             sky_mag = self.gobj[band].cutout['mag_raw'].copy()
-            sky_mag[np.isnan(sky_mag)] = self.gobj[band].brick['psfdepth']
-            ax1.imshow(sky_mag, origin='lower', cmap='gray', vmax=30, vmin=19)
+            sky_lim = self.gobj[band].brick['psfdepth']
+            sky_mag[np.isnan(sky_mag)] = sky_lim
+            ci = np.round(self.center).astype(int)
+            mag_c = min(19, np.mean(self.image[band][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]))
+            ax1.imshow(sky_mag, origin='lower', cmap='gray', vmax=30, vmin=mag_c)
 
-            ax2.imshow(disk_arr, cmap=blues, origin='lower', vmax=25) if (n_model in [0, 2, 3]) else None
-            ax2.imshow(bar_arr, cmap=greens, origin='lower', vmax=25) if n_model == 3 else None
-            ax2.imshow(bulge_arr, cmap=reds, origin='lower', vmax=25) if n_model != 0 else None
             wcs = self.gobj[band].cutout['wcs']
             (sn_ra, sn_dec) = self.gobj[band].gal['sn']
             c = SkyCoord(ra=sn_ra*u.degree, dec=sn_dec*u.degree, frame='icrs')
             sn_px = wcs.world_to_pixel(c)
+            # disk_arr[int(sn_px[1])-10:int(sn_px[1])+10,int(sn_px[0])-10:int(sn_px[0])+10] = 25
+            ax2.imshow(disk_arr, cmap=blues, origin='lower', vmax=25) if (n_model in [0, 2, 3]) else None
+            ax2.imshow(bar_arr, cmap=greens, origin='lower', vmax=25) if n_model == 3 else None
+            ax2.imshow(bulge_arr, cmap=reds, origin='lower', vmax=25) if n_model != 0 else None
+            
             ax2.scatter(sn_px[0], sn_px[1], c='cyan', s=40, lw=2, fc='None', ec='cyan', zorder=10)
 
-            ax3.imshow(sub_mag(sky_mag, both_arr), origin='lower', cmap='gray', vmax=30, vmin=19)
+            ax3.imshow(sub_mag(sky_mag, both_arr), origin='lower', cmap='gray', vmax=30, vmin=mag_c)
             plt.tight_layout()
 
+
+def get_corrections(x, n, tau=0.5, trad=3):
+    # x = 1 - cos(i) = 1-b/a 
+    def BV_g(B, V):
+        return V + 0.6 * (B-V)#  - 0.12
+
+    def BV_r(B, V):
+        return V - 0.42 * (B-V) # + 0.11
+    
+    B_disk_proj = disk_proj[disk_proj['Band'] == 'V']
+    disk_proj_h_pars = B_disk_proj['Ri_R0'].values
+    disk_proj_u0_pars = B_disk_proj['delta_SB0_'].values
+    disk_proj_h = np.poly1d(disk_proj_h_pars[::-1])(x)
+    disk_proj_u0 = np.poly1d(disk_proj_u0_pars[::-1])(x)
+
+    sersic_proj_range = bulge_proj[bulge_proj['trad'] == trad]['n0'].values
+    bulge_proj_Re_pars =  bulge_proj[bulge_proj['trad'] == trad]['Ri_R0'].values
+    bulge_proj_n_pars =  bulge_proj[bulge_proj['trad'] == trad]['ni'].values
+    bulge_proj_Re_interp = np.polyfit(sersic_proj_range, bulge_proj_Re_pars, deg=2)
+    bulge_proj_n_interp = np.polyfit(bulge_proj_n_pars, sersic_proj_range, deg=2)
+    bulge_proj_Re = np.poly1d(bulge_proj_Re_interp)(n)
+    bulge_proj_n = n - np.poly1d(bulge_proj_n_interp)(n)
+
+    B_disk_dust = disk_dust[(disk_dust['Band'] == 'B') & (disk_dust['tau'] == tau)]
+    V_disk_dust = disk_dust[(disk_dust['Band'] == 'V') & (disk_dust['tau'] == tau)]
+    disk_dust_u0_B_pars = B_disk_dust['SBapp_SBi'].values
+    disk_dust_u0_V_pars = V_disk_dust['SBapp_SBi'].values
+    disk_dust_h_pars = V_disk_dust['Rapp_Ri'].values
+    disk_dust_h = np.poly1d(disk_dust_h_pars[::-1])(x)
+    disk_dust_u0_B = np.poly1d(disk_dust_u0_B_pars[::-1])(x)
+    disk_dust_u0_V = np.poly1d(disk_dust_u0_V_pars[::-1])(x)
+    disk_dust_u0_g = BV_g(disk_dust_u0_B, disk_dust_u0_V)
+    disk_dust_u0_r = BV_r(disk_dust_u0_B, disk_dust_u0_V)
+
+    V_bulge_dust = bulge_dust[(bulge_dust['Band'] == 'V') & (bulge_dust['tau'] == tau)]
+    bulge_dust_Re_pars = V_bulge_dust['Rapp_Ri'].values
+    bulge_dust_n_pars = V_bulge_dust['napp'].values
+    bulge_dust_Re = np.poly1d(bulge_dust_Re_pars[::-1])(x)
+    bulge_dust_n = np.poly1d(bulge_dust_n_pars[::-1])(x) - 1
+    
+    return {'disk_proj': [disk_proj_h, disk_proj_u0],
+            'disk_dust': [disk_dust_h, disk_dust_u0_g, disk_dust_u0_r],
+            'bulge_proj': [bulge_proj_Re, bulge_proj_n],
+            'bulge_dust': [bulge_dust_Re, bulge_dust_n]}
+
+
+def K_corr(z, template):
+    filter_g, filter_r = fset['gDEC'], fset['rDEC']
+    filter_g.zp, filter_r.zp  = 22.5, 22.5
+
+    k_g, _ = kcorr.K(template.wl.values, template.fl.values, filter_g, filter_g, z=z)
+    k_r, _ = kcorr.K(template.wl.values, template.fl.values, filter_r, filter_r, z=z)
+    return [k_g, k_r]
