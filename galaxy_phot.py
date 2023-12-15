@@ -74,11 +74,10 @@ class HostGal:
         self.sn_name = 'None'
 
         if catalog == 'virgo':
-            pass
-            # query = Vizier.query_object(host_name, catalog='J/AJ/90/1681')
-            # sc = SkyCoord(ra=query[0]['_RA.icrs'][0], dec=query[0]['_DE.icrs'][0],  unit=(u.hourangle, u.deg))
-            # self.gal = {'host': [sc.ra.deg, sc.dec.deg], 'z': 0.004, 'sn': [sc.ra.deg, sc.dec.deg],
-            #             'A': 0, 'z_source': 'None'}
+            query = Vizier.query_object(host_name, catalog='J/AJ/90/1681')
+            sc = SkyCoord(ra=query[0]['_RA.icrs'][0], dec=query[0]['_DE.icrs'][0],  unit=(u.hourangle, u.deg))
+            self.gal = {'host': [sc.ra.deg, sc.dec.deg], 'z': 0.004, 'sn': [sc.ra.deg, sc.dec.deg],
+                        'A': 0, 'z_source': 'None'}
         
         if catalog == 'sdss':
             pass
@@ -330,15 +329,20 @@ class galaxy_decomp:
         plt.tight_layout()
         return ax1, ax2
         
-    def prep_pixels(self, isophote, window, band):
+    def prep_pixels(self, isophote, window, band, kernal):
         kernal3 = np.array([[ 0,  1,  1],
                             [ -1,  0,  1],
                             [-1,  -1,  0,]])
-
+        kernal5 = np.array([[ 1,  1,  1, 1, 1],
+                            [ 1,  1,  1, 1, 1],
+                            [ 1,  1,  1, 1, 1],
+                            [ 1,  1,  1, 1, 1],
+                            [1,  1,  1, 1, 1]])
         kernal_ = 1/(kernal3 + isophote)
-        kernal_unit = kernal_ / np.sum(kernal_)
-        convolve_1 = convolve2d(self.image[band], kernal_unit, mode='same')
-        convolve_2 = convolve2d(convolve_1, kernal_unit[::-1], mode='same')
+        kernal_ = kernal5
+        kernal_unit = kernal_ / np.sum(kernal_) if kernal == 'default' else kernal
+        convolve_2 = convolve2d(self.image[band], kernal_unit, mode='same')
+        # convolve_2 = convolve2d(convolve_1, kernal_unit[::-1], mode='same')
 
         convolve_2[:5,:] = 0
         convolve_2[-5:,:] = 0
@@ -401,10 +405,10 @@ class galaxy_decomp:
 
         return get_pixels(galaxy_region, connect_).T         
            
-    def contour_fit(self, isophote, mask, band):
+    def contour_fit(self, isophote, mask, band, kernal='default'):
         
         def fit_px(window, return_err):
-            all_pixels = self.prep_pixels(isophote, window, band)
+            all_pixels = self.prep_pixels(isophote, window, band, kernal)
             try:
                 connect_all = self.extract_regions(all_pixels, mask, band)
                 fit_vals = self.image[band].T[connect_all.T[0], connect_all.T[1]]
@@ -464,10 +468,11 @@ class BDdecomp:
         self.image = gd.image
         self.center = gd.center
         self.gobj = gd.gobj
-        self.decomp = [[np.zeros(7), np.zeros(7)], [np.zeros(13), np.zeros(13)], [np.zeros(17), np.zeros(17)], [np.zeros(6), np.zeros(6)]]
+        self.decomp = [[[*np.zeros(7)], [*np.zeros(7)]], [[*np.zeros(13)], [*np.zeros(13)]], 
+                       [[*np.zeros(17)], [*np.zeros(17)]], [[*np.zeros(6)], [*np.zeros(6)]]]
         mags_g, iso_data_g = self.extract_data('g')
         mags_r, iso_data_r = self.extract_data('r')
-        self.mags = {'g': mags_g, 'r': mags_r}
+        # self.mags = {'g': mags_g, 'r': mags_r}
         self.iso_data = {'g': iso_data_g, 'r': iso_data_r}
         if (len(iso_data_g) > 0) and  (len(iso_data_r) > 0):
             self.center, self.iso_stat = self.contour_stats()
@@ -489,9 +494,9 @@ class BDdecomp:
         return mags, pars_
     
     def contour_stats(self):
-        centerx = np.median(np.concatenate([self.iso_data['g'][4], self.iso_data['g'][4]]))
-        centery = np.median(np.concatenate([self.iso_data['g'][5], self.iso_data['g'][5]]))
-        pa = np.median(np.concatenate([self.iso_data['g'][2], self.iso_data['g'][2]]))
+        centerx = np.median(np.concatenate([self.iso_data['g'][4], self.iso_data['r'][4]]))
+        centery = np.median(np.concatenate([self.iso_data['g'][5], self.iso_data['r'][5]]))
+        pa = np.median(np.concatenate([self.iso_data['g'][2], self.iso_data['r'][2]]))
 
         return [centerx, centery], {'pa': pa}
     
@@ -554,31 +559,37 @@ class BDdecomp:
     
     @staticmethod
     def get_b(n):
-        def func(b, n): return 1 - 2*gammainc(2*n[0], b)
-        return fsolve(func, 1.9992*n - 0.3271, args=[n])
+        return 2*n - 1/3 + 4/(405*n) + 46/(25515*n**2)
 
     def transform(self, u0, h, n):
-        b = np.vectorize(self.get_b)(n)
+        b = self.get_b(n)
         return u0 + 2.5*b/np.log(10), b**n*h
     
     def back_transform(self, ue, Re, n):
-        b = np.vectorize(self.get_b)(n)
+        b = self.get_b(n)
         return ue - 2.5*b/np.log(10), Re/b**n
 
     @staticmethod
     def bulge(x, ue, Re, n):
-        # b = np.vectorize(BDdecomp.get_b)(n)
-        b = 1.9992*n - 0.3271
-        return ue + 2.5*b/np.log(10) * ((np.abs(x)/Re)**(1/n) - 1)
+        b = BDdecomp.get_b(n)
+        return ue + 2.5*b/np.log(10) * ((np.abs(x)/np.abs(Re))**(1/n) - 1)
     
     @staticmethod
     def disk(x, u0, h):
-        return u0 + 2.5/np.log(10)*(np.abs(x)/h)
+        return u0 + 2.5/np.log(10)*(np.abs(x)/np.abs(h))
 
     @staticmethod
     def add_mag(m1, m2):
         return -2.5*np.log10(10**(-0.4*m1) + 10**(-0.4*m2))
 
+    @staticmethod
+    def fit_combine(x, ue, u0, Re, h, n):
+        trunc_radius = 5
+        condlist = [(x <= Re*trunc_radius), (x > Re*trunc_radius)]
+        funclist = [lambda x: BDdecomp.bulge(x, ue, Re, n), lambda x: 30*x/x]
+        bulge_trunc = np.piecewise(x, condlist, funclist)
+        return BDdecomp.add_mag(bulge_trunc, BDdecomp.disk(x, u0, h))
+    
     @staticmethod
     def combine(x, ue, u0, Re, h, n):
         return BDdecomp.add_mag(BDdecomp.bulge(x, ue, Re, n), BDdecomp.disk(x, u0, h))
@@ -587,7 +598,7 @@ class BDdecomp:
     def combine_3(x, ue_bulge, ue_bar, u0, Re_bulge, Re_bar, h, n_bulge, n_bar):
         bar_bulge = BDdecomp.add_mag(BDdecomp.bulge(x, ue_bulge, Re_bulge, n_bulge), BDdecomp.bulge(x, ue_bar, Re_bar, n_bar))
         return BDdecomp.add_mag(bar_bulge, BDdecomp.disk(x, u0, h))
-       
+
     def stabilize(self, phi, theta, center0, center1, a, b, pa, n):
         vec = center1 - center0
         beta = np.arctan2(vec[1], vec[0])
@@ -597,6 +608,7 @@ class BDdecomp:
 
     def target_angle(self, c_r, theta):
         target_ang = np.zeros(len(c_r))
+        theta = theta 
         for i, row_i in enumerate(c_r):
             ai, bi, pai, ni, xci, yci, *errs = row_i
             phi_i = fsolve(self.stabilize, theta, args=(theta, self.center, np.array([xci, yci]), ai, bi, pai, ni))
@@ -645,10 +657,10 @@ class BDdecomp:
     def get_meshgrid(self):
         n_size = np.arange(len(self.image['g']))
         xm, ym = np.meshgrid(n_size, n_size)
-        rm = np.linalg.norm(np.stack([xm, ym]).T - self.center, axis=2)
+        rm = np.linalg.norm(np.stack([xm, ym]).T - self.center[::-1], axis=2)
 
-        theta_top = np.arccos(np.dot(np.stack([xm, ym]).T - self.center, np.array([0,1]))/rm)[len(n_size)//2:]
-        theta_bot = np.arccos(np.dot(np.stack([xm, ym]).T - self.center, np.array([0,-1]))/rm)[:len(n_size)//2]
+        theta_top = np.arccos(np.dot(np.stack([xm, ym]).T - self.center[::-1], np.array([0,1]))/rm)[int(self.center[1]):]
+        theta_bot = np.arccos(np.dot(np.stack([xm, ym]).T - self.center[::-1], np.array([0,-1]))/rm)[:int(self.center[1])]
         thetam = np.vstack([theta_bot, theta_top])
         thetam[np.isnan(thetam)] = 0
         return xm, ym, rm, thetam
@@ -667,16 +679,17 @@ class BDdecomp:
         mags = self.iso_data['g'][11]
         mag_err = self.iso_data['g'][10]
         pa = self.iso_stat['pa']
-        max_r = np.mean(self.center)*0.262
+        max_r = self.image['g'].shape[0]/2
 
-        c1_a = curve_fit(self.bulge, r_major, mags, sigma=mag_err, p0=[20, max_r/3, 2], bounds=[[16, 0.1, 0.1], [25, max_r, 8]])[0]
-        c1_b = curve_fit(self.bulge, r_minor, mags, sigma=mag_err, p0=[20, max_r/3, 2], bounds=[[16, 0.1, 0.1], [25, max_r, 8]])[0]
+        c1_a = curve_fit(self.bulge, r_major, mags, sigma=mag_err, p0=[20, max_r/3, 2], bounds=[[16, 0.1, 0.1], [25, max_r, 10]])[0]
+        c1_b = curve_fit(self.bulge, r_minor, mags, sigma=mag_err, p0=[20, max_r/3, 2], bounds=[[16, 0.1, 0.1], [25, max_r, 10]])[0]
         p0_1 = [(c1_a[0]+c1_b[0])/2, (c1_a[0]+c1_b[0])/2-1, (c1_a[2]+c1_b[2])/2, c1_a[1], c1_b[1], pa, 2]
 
         c2_a = curve_fit(self.combine, r_major, mags, sigma=mag_err, p0=[21, 20, max_r/4, max_r/2, 1], bounds=[[16, 16, 0.5, 1, 0.5], [24, 23, max_r, max_r, 3]])[0]
         c2_b = curve_fit(self.combine, r_minor, mags, sigma=mag_err,  p0=[21, 20, max_r/4, max_r/2, 1], bounds=[[16, 16, 0.5, 1, 0.5], [24, 23, max_r, max_r, 3]])[0]
         p0_2 = [(c2_a[0]+c2_b[0])/2, (c2_a[0]+c2_b[0])/2-1, (c2_a[1]+c2_b[1])/2, (c2_a[1]+c2_b[1])/2+1, (c2_a[4]+c2_b[4])/2, 
                 c2_a[2], c2_b[2], pa, 2, c2_a[3], c2_b[3], pa, 2]
+        # p0_2 = [18, 17, 20, 21, 1, 4, 3, pa, 2, 8, 6, pa, 2]
         return p0_1, p0_2
     
     def create_data(self, spokes, plot=False):
@@ -718,7 +731,7 @@ class BDdecomp:
         return {'g': [x_data_g, y_data_g, x_err_g, y_err_g], 'r': [x_data_r, y_data_r, x_err_r, y_err_r], 'all': [x_data, y_data, x_err, y_err]}
 
 
-    def fit_functions(self, spokes):
+    def fit_functions(self, spokes, psf=True, truncate=True):
         xm, ym, rm, thetam = self.get_meshgrid()
         std_g = self.gobj['g'].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
         std_r = self.gobj['r'].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
@@ -739,6 +752,16 @@ class BDdecomp:
             x, y = r*np.cos(np.deg2rad(theta))+self.center[0]*0.262, r*np.sin(np.deg2rad(theta))+self.center[1]*0.262
             return psf_interp[band]((x, y))
         
+        def generate_data(model, data):
+            if psf:
+                psf_interp = psf_convolve(model)
+                data_g = np.concatenate([model_psf(data['g'].reshape(spokes, -1)[i], angle_targets['g'][i], 'g', psf_interp) for i in range(spokes)])
+                data_r = np.concatenate([model_psf(data['r'].reshape(spokes, -1)[i], angle_targets['r'][i], 'r', psf_interp) for i in range(spokes)])
+            else:
+                data_g = np.concatenate([model(data['g'].reshape(spokes, -1)[i], np.deg2rad(angle_targets['g'][i]), 'g') for i in range(spokes)])
+                data_r = np.concatenate([model(data['r'].reshape(spokes, -1)[i], np.deg2rad(angle_targets['r'][i]), 'r') for i in range(spokes)])
+            return np.concatenate([data_g, data_r])
+        
         def disk_2D_model(pars, all_data):
             rp = 2
             u0_g, u0_r = pars[:rp]
@@ -748,10 +771,7 @@ class BDdecomp:
                 h = self.super_ellipse(theta, *pars[rp:rp+4])
                 return self.disk(x, u0[band], h)
             
-            psf_interp = psf_convolve(model)
-            data_g = np.concatenate([model_psf(data['g'].reshape(spokes, -1)[i], angle_targets['g'][i], 'g', psf_interp) for i in range(spokes)])
-            data_r = np.concatenate([model_psf(data['r'].reshape(spokes, -1)[i], angle_targets['r'][i], 'r', psf_interp) for i in range(spokes)])
-            return np.concatenate([data_g, data_r])
+            return generate_data(model, data)
 
         def bulge_2D_model(pars, all_data):
             rp = 3
@@ -762,10 +782,7 @@ class BDdecomp:
                 Re = self.super_ellipse(theta, *pars[rp:rp+4])
                 return self.bulge(x, ue[band], Re, n)
             
-            psf_interp = psf_convolve(model)
-            data_g = np.concatenate([model_psf(data['g'].reshape(spokes, -1)[i], angle_targets['g'][i], 'g', psf_interp) for i in range(spokes)])
-            data_r = np.concatenate([model_psf(data['r'].reshape(spokes, -1)[i], angle_targets['r'][i], 'r', psf_interp) for i in range(spokes)])
-            return np.concatenate([data_g, data_r])
+            return generate_data(model, data)
 
         def bulge_disk_2D_model(pars, all_data):
             rp = 5
@@ -776,12 +793,12 @@ class BDdecomp:
             def model(x, theta, band):
                 Re = self.super_ellipse(theta, *pars[rp:rp+4])
                 h = self.super_ellipse(theta, *pars[rp+4:rp+8])
-                return self.combine(x, ue[band], u0[band], Re, h, n)
+                if truncate:
+                    return self.fit_combine(x, ue[band], u0[band], Re, h, n)
+                else:
+                    return self.combine(x, ue[band], u0[band], Re, h, n)
             
-            psf_interp = psf_convolve(model)
-            data_g = np.concatenate([model_psf(data['g'].reshape(spokes, -1)[i], angle_targets['g'][i], 'g', psf_interp) for i in range(spokes)])
-            data_r = np.concatenate([model_psf(data['r'].reshape(spokes, -1)[i], angle_targets['r'][i], 'r', psf_interp) for i in range(spokes)])
-            return np.concatenate([data_g, data_r])
+            return generate_data(model, data)
         
         def bulge_bar_disk_2D_model(pars, all_data):
             rp = 9
@@ -795,51 +812,15 @@ class BDdecomp:
                 h = self.super_ellipse(theta, *pars[rp+4:rp+8])
                 return self.combine_3(x, ue_bulge[band], ue_bar[band], u0[band], Re_bulge, Re_bar, h, n_bulge, n_bar)
             
-            psf_interp = psf_convolve(model)            
-            data_g = np.concatenate([model_psf(data['g'].reshape(spokes, -1)[i], angle_targets['g'][i], 'g', psf_interp) for i in range(spokes)])
-            data_r = np.concatenate([model_psf(data['r'].reshape(spokes, -1)[i], angle_targets['r'][i], 'r', psf_interp) for i in range(spokes)])
-            return np.concatenate([data_g, data_r])
-
+            return generate_data(model, data)
+        
         return bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model
 
 
-    def main_BD(self, spokes=12, mode=0, verbose=True, disk=1, init_2=[]):
-        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes)
+    def main_BD(self, spokes=12, mode=0, disk=1, psf=True):
+        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes, psf)
+        m1, m2, m3, m4 = self.fit_functions(spokes, psf=False)
 
-        self.decomp_data = self.create_data(spokes)
-        x_data, y_data, x_err, y_err = self.decomp_data['all']
-        data = Data(x_data, y_data, we=1/x_err**2, wd=1/y_err**2)
-
-        p0_1, p0_2 = self.get_init_pars()
-        odr_1 = ODR(data, Model(bulge_2D_model), beta0=p0_1, maxit=10)
-        odr_1.set_job(fit_type=mode)
-        output_1 = odr_1.run()
-        self.decomp[0] = [[*output_1.beta], [*output_1.sd_beta]]
-        
-        if output_1.beta[2] > disk:
-            p0_2 = init_2 if init_2 else p0_2
-            odr_2 = ODR(data, Model(bulge_disk_2D_model), beta0=p0_2, maxit=10)
-            odr_2.set_job(fit_type=mode)
-            output_2 = odr_2.run()
-            self.decomp[1] = [[*output_2.beta], [*output_2.sd_beta]]
-
-    
-    def bulge_bar_disk_decomp(self, spokes=12, mode=0, verbose=False):
-        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes)  
-        
-        if self.decomp[1][0] != 0:
-            self.decomp_data = self.create_data(spokes)
-            x_data, y_data, x_err, y_err = self.decomp_data['all']
-            data = Data(x_data, y_data, we=1/x_err**2, wd=1/y_err**2)
-            ue_g, ue_r, u0_g, u0_r, n, Re_a, Re_b, Re_pa, Re_n, h_a, h_b, h_pa, h_n = self.decomp[1][0]
-            p0_3 = [ue_g-0.5, ue_r-0.5, ue_g+1, ue_r+1, u0_g, u0_r, n, 0.3, Re_b, Re_a, Re_b, Re_pa, Re_n, h_a, h_b, h_pa, h_n]
-            odr_3 = ODR(data, Model(bulge_bar_disk_2D_model), beta0=p0_3, maxit=10)
-            odr_3.set_job(fit_type=mode)
-            output_3 = odr_3.run()
-            self.decomp[2] = [output_3.beta, output_3.sd_beta]
-    
-    def disk_decomp(self, spokes=12, mode=0, verbose=False):
-        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes)  
         self.decomp_data = self.create_data(spokes)
         x_data, y_data, x_err, y_err = self.decomp_data['all']
         data = Data(x_data, y_data, we=1/x_err**2, wd=1/y_err**2)
@@ -847,13 +828,50 @@ class BDdecomp:
         ci = np.round(self.center).astype(int)
         cmag_g = self.image['g'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
         cmag_r = self.image['r'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
+        p0_1 = [np.min(cmag_g)+4, np.min(cmag_r)+4, 2, np.mean(self.iso_data['g'][0]*0.262), np.mean(self.iso_data['g'][1]*0.262),  self.iso_stat['pa'], 2]
         p0_0 = [np.min(cmag_g), np.min(cmag_r),  np.mean(self.iso_data['g'][0]*0.262), np.mean(self.iso_data['g'][1]*0.262), self.iso_stat['pa'], 2]
+
+        odr_1 = ODR(data, Model(bulge_2D_model), beta0=p0_1, maxit=10)
+        odr_1.set_job(fit_type=mode)
+        output_1 = odr_1.run()
+        self.decomp[0] = [[*output_1.beta], [*output_1.sd_beta]]
+
         odr_0 = ODR(data, Model(disk_2D_model), beta0=p0_0, maxit=10)
         odr_0.set_job(fit_type=mode)
         output_0 = odr_0.run()
+        self.decomp[3] = [[*output_0.beta], [*output_0.sd_beta]]
+        
+        if output_1.beta[2] > disk:
+            data_i = Data(x_data[len(x_data//2):], y_data[len(x_data//2):], we=1/x_err[len(x_data//2):]**2, wd=1/y_err[len(x_data//2):]**2)
+            odr_0 = ODR(data_i, Model(m4), beta0=p0_0, maxit=10)
+            output_0 = odr_0.run()
+            u0g, u0r, ha, hb, pa_d, c_d = output_0.beta
+            
+            ind_g = np.argmin(np.abs(self.iso_data['g'][11] - (np.mean(cmag_g)+1)))
+            ai, bi, pai, ci, *rest = self.iso_data['g'].T[ind_g]
+            p0_2 =  [np.min(cmag_g)+1, np.min(cmag_r)+1, u0g, u0r, 1, max(abs(ai), abs(bi))*0.262, min(abs(ai), abs(bi))*0.262, pai, ci, max(abs(ha), abs(hb)), min(abs(ha), abs(hb)), pa_d, c_d]
 
-        BIC_4 = self.BIC(output_0.beta, x_data, y_data, disk_2D_model)
-        self.decomp[3] = [output_0.beta, output_0.sd_beta]
+            odr_2 = ODR(data, Model(bulge_disk_2D_model), beta0=p0_2, maxit=10)
+            odr_2.set_job(fit_type=mode)
+            output_2 = odr_2.run()
+            self.decomp[1] = [[*output_2.beta], [*output_2.sd_beta]]
+
+    
+    def bulge_bar_disk_decomp(self, spokes=12, mode=0, psf=False):
+        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes, psf)  
+        
+        if self.decomp[1][0] != 0:
+            self.decomp_data = self.create_data(spokes)
+            x_data, y_data, x_err, y_err = self.decomp_data['all']
+            data = Data(x_data, y_data, we=1/x_err**2, wd=1/y_err**2)
+            ue_g, ue_r, u0_g, u0_r, n, Re_a, Re_b, Re_pa, Re_n, h_a, h_b, h_pa, h_n = self.decomp[1][0]
+            p0_3 = [ue_g-0.5, ue_r-0.5, ue_g+1, ue_r+1, u0_g, u0_r, n, 0.3, Re_b, Re_a, Re_b, Re_pa, Re_n, h_a, h_b, h_pa, h_n]
+            p0_3= [ue_g+0.1, ue_r+0.1, u0_g-1, u0_r-1, u0_g, u0_r, 1, 0.3, Re_b/2, Re_a*2, Re_b/2, Re_pa+np.pi/3, 3, h_a, h_b, h_pa, h_n]
+            odr_3 = ODR(data, Model(bulge_bar_disk_2D_model), beta0=p0_3, maxit=10)
+            odr_3.set_job(fit_type=mode)
+            output_3 = odr_3.run()
+            self.decomp[2] = [[*output_3.beta], [*output_3.sd_beta]]
+    
 
     def load_main_BD(self, spokes=12, center=False):
         self.decomp_data = self.create_data(spokes, center)
@@ -904,7 +922,7 @@ class BDdecomp:
                     return [a, 1-b/a, ue_g_4-ue_r_4, h_n_4, h_pa_4%(np.pi)]
 
  
-        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes=12)
+        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes=12, truncate=False)
         x_data, y_data, x_err, y_err = self.decomp_data['all']
         if len(x_data) == 0:
             return np.zeros(54)
@@ -1142,7 +1160,7 @@ class BDdecomp:
         sn_deg = np.array([sn_loc.ra.deg, sn_loc.dec.deg])
         host_deg = np.array([host_center.ra.deg, host_center.dec.deg])
         sn_vec = sn_deg - host_deg
-        theta = np.pi - np.arctan(sn_vec[1]/sn_vec[0])
+        theta = np.pi - np.arctan(sn_vec[1]/sn_vec[0]) # is this still correct?
 
         if self.decomp[0][0][0] != 0:
             if gal_i == 3:
@@ -1334,9 +1352,8 @@ class BDdecomp:
                        proj_h, proj_u0, dust_h, dust_u0_g, dust_u0_r, gal_Re, gal_ecc, gal_pa, bulge_mag_g, bulge_mag_r, bulge_lum_g, bulge_lum_r, bar_mag_g, bar_mag_r, bar_lum_g, bar_lum_r,
                        disk_mag_g, disk_mag_r, disk_lum_g, disk_lum_r]
                                                       
-                    
 
-    def plot_func(self):
+    def plot_func(self, psf):
         xm, ym, rm, thetam = self.get_meshgrid()
         std_g = self.gobj['g'].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
         std_r = self.gobj['r'].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
@@ -1356,6 +1373,13 @@ class BDdecomp:
             x, y = r*np.cos(theta)+self.center[0]*0.262, r*np.sin(theta)+self.center[1]*0.262
             return psf_interp[band]((x, y))
         
+        def generate_data(model, x_data, theta, band):
+            if psf:
+                psf_interp = psf_convolve(model)
+                return model_psf(x_data, theta, band, psf_interp)
+            else:
+                return model(x_data, theta, band)
+        
         def disk_2D_model(x_data, pars, theta, band):
             rp = 2
             u0_g, u0_r = pars[:rp]
@@ -1363,9 +1387,7 @@ class BDdecomp:
             def model(x, theta, band):
                 h = self.super_ellipse(theta, *pars[rp:rp+4])
                 return self.disk(x, u0[band], h)
-            
-            psf_interp = psf_convolve(model)
-            return model_psf(x_data, theta, band, psf_interp)
+            return generate_data(model, x_data, theta, band)
 
         def bulge_2D_model(x_data, pars, theta, band):
             rp = 3
@@ -1374,9 +1396,7 @@ class BDdecomp:
             def model(x, theta, band):
                 Re = self.super_ellipse(theta, *pars[rp:rp+4])
                 return self.bulge(x, ue[band], Re, n)
-            
-            psf_interp = psf_convolve(model)
-            return model_psf(x_data, theta, band, psf_interp)
+            return generate_data(model, x_data, theta, band)
 
         def bulge_disk_2D_model(x_data, pars, theta, band):
             rp = 5
@@ -1387,10 +1407,8 @@ class BDdecomp:
                 Re = self.super_ellipse(theta, *pars[rp:rp+4])
                 h = self.super_ellipse(theta, *pars[rp+4:rp+8])
                 return self.combine(x, ue[band], u0[band], Re, h, n)
-            
-            psf_interp = psf_convolve(model)
-            return model_psf(x_data, theta, band, psf_interp)
-        
+            return generate_data(model, x_data, theta, band)
+
         def bulge_bar_disk_2D_model(x_data, pars, theta, band):
             rp = 9
             ue_bulge_g, ue_bulge_r, ue_bar_g, ue_bar_r, u0_g, u0_r, n_bulge, n_bar, Re_bulge = pars[:rp]
@@ -1401,19 +1419,17 @@ class BDdecomp:
                 Re_bar = self.super_ellipse(theta, *pars[rp:rp+4])
                 h = self.super_ellipse(theta, *pars[rp+4:rp+8])
                 return self.combine_3(x, ue_bulge[band], ue_bar[band], u0[band], Re_bulge, Re_bar, h, n_bulge, n_bar)
-            
-            psf_interp = psf_convolve(model)
-            return model_psf(x_data, theta, band, psf_interp)
+            return generate_data(model, x_data, theta, band)
+
         return  disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model
 
         
-    def plot_spokes(self, sigma=3, n_model=2):
+    def plot_spokes(self, sigma=3, n_model=2, psf=True):
         spokes=12
         rp = [3, 5, 9, 2][n_model-1]
-        disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model = self.plot_func()  
+        disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model = self.plot_func(psf)  
         fig, axis = plt.subplots(figsize=(18, 10), ncols=2, nrows=3, dpi=100)
 
-        z = self.gobj['g'].gal['z']
         wcs = self.gobj['g'].cutout['wcs']
         sn_loc = SkyCoord(*self.gobj['g'].gal['sn'], unit='deg')
         host_center = wcs.pixel_to_world(*self.center)
@@ -1423,7 +1439,6 @@ class BDdecomp:
         sn_vec = sn_deg - host_deg
         theta_sn = np.arctan(sn_vec[1]/sn_vec[0])
 
-        
         for i in range(6):
             band = 'g' if i%2 == 0 else 'r'
             bd_data = self.decomp_data[band]
@@ -1466,7 +1481,8 @@ class BDdecomp:
                 Re_bulge = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp:rp+4])
                 h_disk = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp+4:rp+8])    
                 ax.plot(x_ax, bulge_disk_2D_model(x_ax, self.decomp[n_model-1][0], np.deg2rad(theta[i]), band), 'r-', label=f'combined_{band}')
-                ax.plot(x_ax, self.bulge(x_ax, ue_bulge, Re_bulge, n_sersic), 'g--', label='bulge')
+                x_bulge = np.linspace(0, 5*Re_bulge, 100)
+                ax.plot(x_bulge, self.bulge(x_bulge, ue_bulge, Re_bulge, n_sersic), 'g--', label='bulge')
                 ax.plot(x_ax, self.disk(x_ax, u0_disk, h_disk), 'b--', label='disk')
                 ax.legend()
 
@@ -1493,6 +1509,7 @@ class BDdecomp:
                 ax.legend() 
 
         plt.tight_layout()
+
 
     def SB_profile(self, r, theta, band, model='all', n_model=2, px=True, corr=False):
         z = self.gobj['g'].gal['z']
@@ -1635,7 +1652,7 @@ class BDdecomp:
             disk_a, disk_b, disk_pa, disk_n = self.decomp[n_model-1][0][rp+4:rp+8]
             u0_g, u0_r = self.decomp[n_model-1][0][4:6]
             u0_disk = {'g': u0_g, 'r': u0_r}[band]
-            ue_disk, (disk_a, disk_b) = self.transform(u0_disk, [disk_a, disk_b], n=1)
+            ue_disk, (disk_a, disk_b) = self.transform(u0_disk, np.array([disk_a, disk_b]), n=1)
             self.patch_super_ellipse(np.array([disk_a, disk_b, disk_pa, disk_n])/arcsec2px, self.center, ax2, 'blue', label='Disk $R_e$')
 
         elif n_model == 2:
@@ -1643,7 +1660,7 @@ class BDdecomp:
             u0_g, u0_r = self.decomp[n_model-1][0][2:rp-1]
             u0_disk = {'g': u0_g, 'r': u0_r}[band]
             disk_a, disk_b, disk_pa, disk_n = self.decomp[n_model-1][0][rp+4:rp+8]
-            ue_disk, (disk_a, disk_b) = self.transform(u0_disk, [disk_a, disk_b], n=1)
+            ue_disk, (disk_a, disk_b) = self.transform(u0_disk, np.array([disk_a, disk_b]), n=1)
             self.patch_super_ellipse(np.array([disk_a, disk_b, disk_pa, disk_n])/arcsec2px, self.center, ax2, 'blue', label='Disk $R_e$')
 
         elif n_model == 1:
@@ -1653,7 +1670,7 @@ class BDdecomp:
             disk_a, disk_b, disk_pa, disk_n = self.decomp[n_model-1][0][rp:rp+4]
             u0_g, u0_r = self.decomp[n_model-1][0][:rp]
             u0_disk = {'g': u0_g, 'r': u0_r}[band]
-            ue_disk, (disk_a, disk_b) = self.transform(u0_disk, [disk_a, disk_b], n=1)
+            ue_disk, (disk_a, disk_b) = self.transform(u0_disk, np.array([disk_a, disk_b]), n=1)
             self.patch_super_ellipse(np.array([disk_a, disk_b, disk_pa, disk_n])/arcsec2px, self.center, ax2, 'blue', label='Disk $R_e$')
         
         if isophote:
