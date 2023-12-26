@@ -1,9 +1,6 @@
-import bs4
-import lxml
-import ztfidr
 import requests
-import sympy as smp
 import numpy as np
+import sympy as smp
 import pandas as pd
 from io import BytesIO
 from extinction import fm07
@@ -13,52 +10,50 @@ from snpy import kcorr, fset
 from astropy import units as u
 from astropy.table import Table
 import matplotlib.pyplot as plt
-from scipy.integrate import quad
-from skimage import measure, draw
+from scipy.special import gamma
+from scipy.signal import convolve 
 from scipy.signal import convolve2d
-# from astroquery.ipac.ned import Ned
 from astroquery.vizier import Vizier
 from astropy.cosmology import Planck18
-from matplotlib.patches import Ellipse
-from scipy.interpolate import interp1d, RegularGridInterpolator
 from scipy.odr import Model, Data, ODR
 from skimage.measure import EllipseModel
 from astropy.coordinates import SkyCoord
-from scipy.ndimage import gaussian_filter
-from scipy.special import gamma, gammainc
 from matplotlib.colors import ListedColormap
+from astropy.convolution import  Moffat2DKernel
 from skimage.measure import label as ConnectRegion
-from astroquery.exceptions import RemoteServiceError
+from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import curve_fit, fsolve, minimize
-from astropy.convolution import convolve_fft, Gaussian2DKernel
 
-sample = ztfidr.get_sample()
-host_data = ztfidr.io.get_host_data()
+
 Vizier.ROW_LIMIT = 1000
 disk_proj = Vizier.get_catalogs('J/A+A/553/A80/tablea1')[0].to_pandas()
 disk_dust = Vizier.get_catalogs('J/A+A/553/A80/dexp')[0].to_pandas()
 
-df_update = pd.read_csv('dr2/tables/.dataset_creation/host_prop/host_match/ztfdr2_matched_hosts.csv', index_col=0)
-df_mass = pd.read_csv('csv_files/ztfdr2_globalhost_prop.csv', index_col=0)
-df_gp = pd.read_csv('csv_files/ZTFidr_all_gri_kcor_salt_gp_fitted_clipped_z_0.3.csv', index_col=0)
+# files from DR2 22/12/2023
+df_host = pd.read_csv('dr2/tables/.dataset_creation/host_prop/host_match/ztfdr2_matched_hosts.csv', index_col=0) # host coords
+df_coord = pd.read_csv('dr2/tables/ztfdr2_coordinates.csv', index_col=0) # sn coords
+df_red = pd.read_csv('dr2/tables/ztfdr2_redshifts.csv', index_col=0) # redshift
+df_salt = pd.read_csv('dr2/tables/ztfdr2_salt2_params.csv', index_col=0) # salt, mw
+df_class = pd.read_csv('csv_files/ztfdr2_subclassifications.csv', index_col=0) # class
+df_mass = pd.read_csv('dr2/tables/ztfdr2_globalhost_prop.csv', index_col=0) # host mass
+si_umut = pd.read_csv('csv_files/sample_features.csv') # silicon
+
 df10 = Table.read('fits_files/survey-bricks-dr10-south.fits.gz', format='fits')
 df9 = Table.read('fits_files/survey-bricks-dr9-north.fits.gz', format='fits')
-df_iso = pd.read_csv('csv_files/galaxy_isophotes.csv', index_col=0)
-df_bd1 = pd.read_csv('csv_files/one_decomp.csv', index_col=0)
-df_bd2 = pd.read_csv('csv_files/two_decomp.csv', index_col=0)
-df_bd3 = pd.read_csv('csv_files/three_decomp.csv', index_col=0)
-df_bd0 = pd.read_csv('csv_files/disk_decomp.csv', index_col=0)
-si_umut = pd.read_csv('csv_files/sample_features.csv')
+
+df_iso = pd.read_csv('csv_files/galaxy_isophotes_.csv', index_col=0)
+df_bd1 = pd.read_csv('csv_files/bulge_pars_.csv', index_col=0)
+df_bd2 = pd.read_csv('csv_files/bulge_disk_pars_.csv', index_col=0)
+df_bd3 = pd.read_csv('csv_files/bulge_bar_disk_pars_.csv', index_col=0)
+df_bd0 = pd.read_csv('csv_files/disk_pars_.csv', index_col=0)
 
 df_E = pd.read_csv('templates/E',delim_whitespace=True,names=['wl','fl'])
 df_s0 = pd.read_csv('templates/s0',delim_whitespace=True,names=['wl','fl'])
 df_sab =  pd.read_csv('templates/sb',delim_whitespace=True,names=['wl','fl'])
 df_sc =  pd.read_csv('templates/sc',delim_whitespace=True,names=['wl','fl'])
-
 df_bulge = fits.open('templates/old_temp/bulge_template.fits')
 wl_b, fl_b = df_bulge[1].data['WAVELENGTH'], df_bulge[1].data['FLUX']
 df_b = pd.DataFrame(np.column_stack([wl_b, fl_b]), columns=['wl', 'fl'])
-
 
 
 class HostGal:
@@ -78,42 +73,29 @@ class HostGal:
             sc = SkyCoord(ra=query[0]['_RA.icrs'][0], dec=query[0]['_DE.icrs'][0],  unit=(u.hourangle, u.deg))
             self.gal = {'host': [sc.ra.deg, sc.dec.deg], 'z': 0.004, 'sn': [sc.ra.deg, sc.dec.deg],
                         'A': 0, 'z_source': 'None'}
-        
-        if catalog == 'sdss':
-            pass
-            # self.gal = {'host': [qs[0][host_name]['_RA'], qs[0][host_name]['_DE']], 'z': qs[0][host_name]['z'], 
-            #             'sn': [qs[0][host_name]['_RA'], qs[0][host_name]['_DE']], 'A': 0, 'z_source': 'None'}
-            # print(self.gal['z']) if self.verbose else None
 
     def init_dr2(self, sn_name):
         self.host_name = 'DR2'
         self.sn_name = sn_name
 
-        z = sample.data['redshift'][sn_name]
-        host_ra, host_dec = df_update[['ra', 'dec']].loc[sn_name]
-        if np.isnan(host_ra) or np.isnan(host_dec):
-            host_ra, host_dec = host_data[['host_ra', 'host_dec']].loc[sn_name]
-            
-        mwebv, mwr_v, sn_ra, sn_dec, z_source = sample.data[['mwebv', 'mwr_v', 'ra', 
-                                                                'dec', 'source']].loc[sn_name]
-        if host_dec == -80:
+        z, z_err, z_source = df_red.loc[sn_name]
+        mwebv, mwr_v = df_salt[['mwebv','mwr_v']].loc[sn_name]
+        sn_ra, sn_dec = df_coord[['ra', 'dec']].loc[sn_name]
+        host_ra, host_dec = df_host[['ra', 'dec']].loc[sn_name]
+        if np.isnan(host_ra) or np.isnan(host_dec) or (host_dec == -80):
             host_ra, host_dec = sn_ra, sn_dec
             print('no host') if self.verbose else None
         if self.verbose:
             print(f'{sn_name}, ra={host_ra:.3f}, dec={host_dec:.3f}')
             print(f'z={z:.4f}, z_source={z_source}')
         self.gal = {'host': [host_ra, host_dec], 'z': z, 'sn': [sn_ra, sn_dec],
-                     'A': mwebv * mwr_v, 'z_source': z_source}
+                     'A': mwebv * mwr_v, 'z_err': z_err, 'z_source': z_source}
            
     def get_cutout(self, size, band, scale=0.262):
         ra, dec = self.gal['host']
-
-        def legacy_url(survey):
-            layer = 'ls-dr10' if survey == 'legacy' else 'sdss'
-            service = 'https://www.legacysurvey.org/viewer/'
-            return f'{service}fits-cutout?ra={ra}&dec={dec}&layer={layer}&pixscale={scale}&bands={band}&size={size}&subimage'
-
-        url = legacy_url('legacy')
+        layer = 'ls-dr10'
+        service = 'https://www.legacysurvey.org/viewer/'
+        url = f'{service}fits-cutout?ra={ra}&dec={dec}&layer={layer}&pixscale={scale}&bands={band}&size={size}&subimage'
         res = requests.get(url, timeout=10)
         if len(res.content) > 1000:
             return fits.open(BytesIO(res.content))
@@ -134,18 +116,17 @@ class HostGal:
         
         zp = 22.5
         self.brick['sky_mag'] = float(mag_soft(self.brick['sky'], zp))
-        flux = flux - self.brick['sky']
         return mag_soft(flux, zp) if soft else mag_(flux, zp)
 
     @staticmethod
     def calc_aperature(size, redshift, scale):
         if size == 'z':
             if np.sign(redshift) == -1:
-                return 500
+                return 600
             else:
                 aperature = 0.07 
-                dist = Planck18.luminosity_distance(redshift)
-                return min(int(np.rad2deg(aperature/dist.value)*(3600/scale)),  500)
+                dist = Planck18.angular_diameter_distance(redshift).value
+                return min(round(np.rad2deg(aperature/dist)*3600/scale),  600)
         else:
             return size
         
@@ -162,7 +143,7 @@ class HostGal:
 
         if len(fits_list) <= 1:
             print('no file') if self.verbose else None
-            raise FileNotFoundError
+            return [], [], [], []
         else:
             data_shapes = np.zeros(len(fits_list))
             for i in range(1, len(fits_list), 2):
@@ -210,13 +191,16 @@ class HostGal:
                  'galdepth':  bmean('galdepth'), 'sky': bmean('sky'), 'dr': brick_l['dr']}
         return flux, invvar, wcs, brick
         
-    def get_image(self, source, size, band, scale):
+    def get_image(self, source, size, band, scale=0.262):
         path = f'dr2_fits_{band}/{self.sn_name}.fits'
         output_size = self.calc_aperature(size, self.gal['z'], scale)
         if source == 'query':
             fits_data = self.get_cutout(output_size, band, scale)
         elif source == 'save':
-            fits_data = fits.open(path)
+            try:
+                fits_data = fits.open(path)
+            except FileNotFoundError:
+                fits_data = []
         elif source == 'query_save':
             fits_data = self.get_cutout(output_size, band, scale)
             if type(fits_data) == list:
@@ -281,7 +265,7 @@ class galaxy_decomp:
         self.flux = {'g': self.gobj['g'].cutout['flux'], 'r': self.gobj['r'].cutout['flux']} 
         self.center = (np.array(self.image['g'].shape))/2
 
-    def plot_fit(self, isophotes, band, width=0.1, mask=False, zoom=False):
+    def plot_fit(self, isophotes, band, width=0.1, zoom=False):
         fig, (ax1, ax2) = plt.subplots(figsize=(12, 6), dpi=100, ncols=2)
         mag, wcs = self.image[band], self.gobj[band].cutout['wcs']
         ax2.imshow(mag, cmap='gray', origin='lower')
@@ -290,13 +274,6 @@ class galaxy_decomp:
         c = SkyCoord(ra=sn_ra*u.degree, dec=sn_dec*u.degree, frame='icrs')
         sn_px = wcs.world_to_pixel(c)
         ax2.scatter(sn_px[0], sn_px[1], c='cyan', s=40, lw=2, fc='None', ec='cyan')
-
-        if np.any(mask):
-            for (ra, dec, r) in mask:
-                coords = SkyCoord(ra=ra*u.degree, dec=dec*u.degree, frame='icrs')
-                m_px = wcs.world_to_pixel(coords)
-                m_patch = Ellipse((m_px[0], m_px[1]), 2*r, 2*r, 0, edgecolor='black', facecolor='black', zorder=10, alpha=0.5)
-                ax1.add_patch(m_patch)
   
         targets = self.contours[band].keys() if isophotes == 'all' else isophotes
         for i, iso_i in enumerate(targets):
@@ -330,19 +307,13 @@ class galaxy_decomp:
         return ax1, ax2
         
     def prep_pixels(self, isophote, window, band, kernal):
-        kernal3 = np.array([[ 0,  1,  1],
-                            [ -1,  0,  1],
-                            [-1,  -1,  0,]])
         kernal5 = np.array([[ 1,  1,  1, 1, 1],
                             [ 1,  1,  1, 1, 1],
                             [ 1,  1,  1, 1, 1],
                             [ 1,  1,  1, 1, 1],
                             [1,  1,  1, 1, 1]])
-        kernal_ = 1/(kernal3 + isophote)
-        kernal_ = kernal5
-        kernal_unit = kernal_ / np.sum(kernal_) if kernal == 'default' else kernal
+        kernal_unit = kernal5 / np.sum(kernal5) if kernal == 'default' else kernal
         convolve_2 = convolve2d(self.image[band], kernal_unit, mode='same')
-        # convolve_2 = convolve2d(convolve_1, kernal_unit[::-1], mode='same')
 
         convolve_2[:5,:] = 0
         convolve_2[-5:,:] = 0
@@ -383,34 +354,24 @@ class galaxy_decomp:
         ax.plot(xse_t, yse_t, 'r-', color=color, zorder=10, label=label)
         ax.plot(xse_t[[0, -1]], yse_t[[0, -1]], 'r-', color=color, zorder=10)
 
-    def extract_regions(self, contour, mask, band):
+    def extract_regions(self, contour, band):
         def get_pixels(region, connect): return np.stack(np.where(connect == region))
 
         binary_image = np.zeros_like(self.image[band], dtype=np.uint8)
         binary_image[contour[0], contour[1]] = 1
         connect_ = ConnectRegion(binary_image, connectivity=2, background=0)
         region_count = np.asarray(np.unique(connect_, return_counts=True)).T[1:].T
-        galaxy_region = max(region_count.T, key=lambda x: x[1])[0]
-        # galaxy_region = min(region_count.T, key=lambda x: np.sum(np.mean(get_pixels(x[0], connect_).T , axis=0) - self.center)**2)[0]
-
-        if np.any(mask):
-            for (ra, dec, r) in mask:
-                coords = SkyCoord(ra=ra*u.degree, dec=dec*u.degree, frame='icrs')
-                m_px = self.gobj[band].cutout['wcs'].world_to_pixel(coords)
-                ell_px = draw.ellipse(m_px[0], m_px[1], r, r, rotation=0)
-                mask = np.ones_like(self.image[band])
-                px_cutoff = (ell_px[0] < self.image[band].shape[0]) & (ell_px[1] < self.image[band].shape[0])
-                mask[ell_px[0][px_cutoff], ell_px[1][px_cutoff]] = 0
-                connect_ = connect_ * mask
+        # galaxy_region = max(region_count.T, key=lambda x: x[1])[0]
+        galaxy_region = min(region_count.T, key=lambda x: np.sum(np.mean(get_pixels(x[0], connect_).T , axis=0) - self.center)**2)[0]
 
         return get_pixels(galaxy_region, connect_).T         
            
-    def contour_fit(self, isophote, mask, band, kernal='default'):
+    def contour_fit(self, isophote, band, kernal='default'):
         
         def fit_px(window, return_err):
             all_pixels = self.prep_pixels(isophote, window, band, kernal)
             try:
-                connect_all = self.extract_regions(all_pixels, mask, band)
+                connect_all = self.extract_regions(all_pixels, band)
                 fit_vals = self.image[band].T[connect_all.T[0], connect_all.T[1]]
                 fit_invvar = var_frac.T[connect_all.T[0], connect_all.T[1]]
                 cuts = (fit_vals > isophote-window) & (fit_vals < isophote+window)
@@ -423,7 +384,7 @@ class galaxy_decomp:
 
                 px_uncertainity =  fit_invvar/linear(fit_vals, *slope_corr[0])
                 pars, pars_err, center = self.super_ellipse_fitter(connect_all, px_uncertainity)
-            except (RuntimeError, ValueError):
+            except (RuntimeError, ValueError, TypeError):
                 if return_err:
                     return 1
                 else:
@@ -435,26 +396,34 @@ class galaxy_decomp:
                     return [[*pars, *center, *pars_err, fit_invvar.mean(), fit_vals.mean()], [all_pixels, connect_all, window]]
 
         var_frac = np.abs(-2.5/np.log(10)*np.sqrt(1/self.invvar[band])/self.flux[band])
-        result = minimize(fit_px, 0.2, args=(True), bounds=[(0.1, 0.5)], method='Powell', tol=0.1)
-        self.contours[band][isophote] = fit_px(result.x, return_err=False)
+        try:
+            result = minimize(fit_px, 0.2, args=(True), bounds=[(0.1, 0.5)], method='Powell', tol=0.1)
+        except (ValueError, TypeError):
+            self.contours[band][isophote] =  [[0,0,0,0,0,0,0,0,0,0,0,0], [[], [], 0]]
+        else:
+            self.contours[band][isophote] = fit_px(result.x, return_err=False)
 
     def main_run(self):
         step = 0.2
+        sb_lim ={'dr10': {'g': 24.9, 'r': 24.5}, 
+                  'dr9':  {'g': 24.3, 'r': 23.7}}
+        max_galaxy_sb, min_galaxy_sb = 15, 25
+        sb_break_lim = 23
         for band in ['g', 'r']:
-            max_iso = min(round(self.gobj[band].brick['psfdepth'], 1), 25)
-            max_iso = 24 if max_iso == 0 else max_iso
-            for iso in np.arange(max_iso, 16, -step):
+            max_iso = min(round(self.gobj[band].brick['psfdepth'], 1), min_galaxy_sb)
+            max_iso = sb_lim[self.gobj[band].brick['dr']][band] if max_iso == 0 else max_iso
+            for iso in np.arange(max_iso, max_galaxy_sb, -step):
                 iso = np.round(iso, 1)
                 print(f'{band}-{iso}') if (iso%1==0.0 and self.verbose) else None
-                self.contour_fit(iso, mask=[], band=band)
+                self.contour_fit(iso, band=band)
                 if len(self.contours[band][iso][1][1]) == 0:
                     del self.contours[band][iso]
-                    if iso < 23:
+                    if iso < sb_break_lim:
                         break
         
     def load_main_run(self):
         iso_data = df_iso[df_iso['sn_name'] == self.name]
-        if iso_data.iloc[0]['band'] != 'error':    
+        if (iso_data.iloc[0]['band'] != 'no_image') and (iso_data.iloc[0]['band'] != 'no_contours'):    
             for i in range(len(iso_data)):
                 data_i = iso_data.iloc[i]
                 self.contours[data_i['band']][np.round(data_i['mag'],1)] = [data_i.values[2:].astype(float)]
@@ -468,14 +437,39 @@ class BDdecomp:
         self.image = gd.image
         self.center = gd.center
         self.gobj = gd.gobj
+        self.scale = 0.262
+        self.trunc_bulge = 5
+        self.trunc_bar = 5
         self.decomp = [[[*np.zeros(7)], [*np.zeros(7)]], [[*np.zeros(13)], [*np.zeros(13)]], 
                        [[*np.zeros(17)], [*np.zeros(17)]], [[*np.zeros(6)], [*np.zeros(6)]]]
         mags_g, iso_data_g = self.extract_data('g')
         mags_r, iso_data_r = self.extract_data('r')
-        # self.mags = {'g': mags_g, 'r': mags_r}
+        self.mags = {'g': mags_g, 'r': mags_r}
         self.iso_data = {'g': iso_data_g, 'r': iso_data_r}
         if (len(iso_data_g) > 0) and  (len(iso_data_r) > 0):
             self.center, self.iso_stat = self.contour_stats()
+        
+        self.kernal = self.get_psf_kernals()
+        
+        
+    def get_psf_kernals(self):
+        power = 4.765
+        fwhm_psf_g = self.gobj['g'].brick['psfsize']
+        fwhm_psf_r = self.gobj['r'].brick['psfsize']
+        fwhm_psf_g_mean = {'dr10': 1.51, 'dr9': 1.91}[self.gobj['g'].brick['dr']]
+        fwhm_psf_r_mean = {'dr10': 1.36, 'dr9': 1.7}[self.gobj['r'].brick['dr']]
+        if (fwhm_psf_g == 0) and (fwhm_psf_r == 0):
+            fwhm_psf_g, fwhm_psf_r = fwhm_psf_g_mean, fwhm_psf_r_mean
+        elif (fwhm_psf_g == 0) and (fwhm_psf_r != 0):
+            fwhm_psf_g = fwhm_psf_r + (fwhm_psf_g_mean-fwhm_psf_r_mean)
+        elif (fwhm_psf_g != 0) and (fwhm_psf_r == 0):
+             fwhm_psf_r = fwhm_psf_g - (fwhm_psf_g_mean-fwhm_psf_r_mean)
+
+        core_g = fwhm_psf_g/(2*np.sqrt(2**(1/power) - 1))/self.scale
+        core_r = fwhm_psf_r/(2*np.sqrt(2**(1/power) - 1))/self.scale
+        return {'g': Moffat2DKernel(gamma=core_g, alpha=power).array,
+                'r': Moffat2DKernel(gamma=core_r, alpha=power).array}
+
 
     def extract_data(self, band):
         key_targs = list(self.contours[band].keys())
@@ -484,10 +478,11 @@ class BDdecomp:
         pars_ = np.array([self.contours[band][iso_key][0] for iso_key in key_targs if len(self.contours[band][iso_key][0]) > 0]).T
 
         offsets = np.sqrt((pars_[4]-self.center[0])**2 + (pars_[5]-self.center[1])**2)
-        cuts = np.where((offsets < 5))
+        cuts = np.where((offsets < 10))
 
         mags = np.array(key_targs)[cuts]
         pars_ = pars_.T[cuts].T.reshape((12, -1))
+
         if len(pars_) == 0:
             return [], []
 
@@ -497,6 +492,11 @@ class BDdecomp:
         centerx = np.median(np.concatenate([self.iso_data['g'][4], self.iso_data['r'][4]]))
         centery = np.median(np.concatenate([self.iso_data['g'][5], self.iso_data['r'][5]]))
         pa = np.median(np.concatenate([self.iso_data['g'][2], self.iso_data['r'][2]]))
+
+        offsets_g = np.sqrt((self.iso_data['g'][4]-centerx)**2 + (self.iso_data['g'][5]-centery)**2)
+        offsets_r = np.sqrt((self.iso_data['r'][4]-centerx)**2 + (self.iso_data['r'][5]-centery)**2)
+        self.iso_data['g'] = (self.iso_data['g'].T[(offsets_g < 5)]).T
+        self.iso_data['r'] = (self.iso_data['r'].T[(offsets_r < 5)]).T
 
         return [centerx, centery], {'pa': pa}
     
@@ -511,13 +511,13 @@ class BDdecomp:
             y = r*np.sin(phi)
             return x, y
 
-    def patch_super_ellipse(self, pars, center, ax, color, label=None):
+    def patch_super_ellipse(self, pars, center, ax, color, label=None, lw=1):
         t_r = np.arange(-np.pi/2, np.pi/2, 0.01)+ pars[2]
         xse, yse = self.super_ellipse(t_r, *pars, polar=False) 
         xse_t = np.concatenate([xse, -xse])+ center[0]
         yse_t = np.concatenate([yse, -yse])+ center[1]
-        ax.plot(xse_t, yse_t, 'r-', color=color, zorder=6, label=label)
-        ax.plot(xse_t[[0, -1]], yse_t[[0, -1]], 'r-', color=color, zorder=10)
+        ax.plot(xse_t, yse_t, 'r-', color=color, zorder=6, label=label ,lw=lw)
+        ax.plot(xse_t[[0, -1]], yse_t[[0, -1]], 'r-', color=color, zorder=10, lw=lw)
     
     def plot_iso(self, band):
         pars_ = self.iso_data[band]
@@ -585,10 +585,9 @@ class BDdecomp:
     @staticmethod
     def fit_combine(x, ue, u0, Re, h, n):
         trunc_radius = 5
-        condlist = [(x <= Re*trunc_radius), (x > Re*trunc_radius)]
-        funclist = [lambda x: BDdecomp.bulge(x, ue, Re, n), lambda x: 30*x/x]
-        bulge_trunc = np.piecewise(x, condlist, funclist)
-        return BDdecomp.add_mag(bulge_trunc, BDdecomp.disk(x, u0, h))
+        condlist = [(x <= np.abs(Re)*trunc_radius), (x > np.abs(Re)*trunc_radius)]
+        choicelist = [BDdecomp.add_mag(BDdecomp.bulge(x, ue, Re, n), BDdecomp.disk(x, u0, h)), BDdecomp.disk(x, u0, h)]
+        return np.select(condlist, choicelist)
     
     @staticmethod
     def combine(x, ue, u0, Re, h, n):
@@ -598,6 +597,17 @@ class BDdecomp:
     def combine_3(x, ue_bulge, ue_bar, u0, Re_bulge, Re_bar, h, n_bulge, n_bar):
         bar_bulge = BDdecomp.add_mag(BDdecomp.bulge(x, ue_bulge, Re_bulge, n_bulge), BDdecomp.bulge(x, ue_bar, Re_bar, n_bar))
         return BDdecomp.add_mag(bar_bulge, BDdecomp.disk(x, u0, h))
+
+    @staticmethod
+    def fit_combine_3(x, ue_bulge, ue_bar, u0, Re_bulge, Re_bar, h, n_bulge, n_bar):
+        trunc_r_bulge, trunc_r_bar = 5*np.abs(Re_bulge), 5*np.abs(Re_bar)
+        condlist = [(x <= trunc_r_bulge) & (x <= trunc_r_bar), (x <= trunc_r_bulge) & (x > trunc_r_bar), 
+                    (x > trunc_r_bulge) & (x <= trunc_r_bar), (x > trunc_r_bulge) & (x > trunc_r_bar)]
+        choicelist = [BDdecomp.add_mag(BDdecomp.add_mag(BDdecomp.bulge(x, ue_bulge, Re_bulge, n_bulge), BDdecomp.bulge(x, ue_bar, Re_bar, n_bar)),  BDdecomp.disk(x, u0, h)),
+                       BDdecomp.add_mag(BDdecomp.bulge(x, ue_bulge, Re_bulge, n_bulge),  BDdecomp.disk(x, u0, h)),
+                       BDdecomp.add_mag(BDdecomp.bulge(x, ue_bar, Re_bar, n_bar),  BDdecomp.disk(x, u0, h)),
+                       BDdecomp.disk(x, u0, h)]
+        return np.select(condlist, choicelist)
 
     def stabilize(self, phi, theta, center0, center1, a, b, pa, n):
         vec = center1 - center0
@@ -659,8 +669,8 @@ class BDdecomp:
         xm, ym = np.meshgrid(n_size, n_size)
         rm = np.linalg.norm(np.stack([xm, ym]).T - self.center[::-1], axis=2)
 
-        theta_top = np.arccos(np.dot(np.stack([xm, ym]).T - self.center[::-1], np.array([0,1]))/rm)[int(self.center[1]):]
-        theta_bot = np.arccos(np.dot(np.stack([xm, ym]).T - self.center[::-1], np.array([0,-1]))/rm)[:int(self.center[1])]
+        theta_top = np.arccos(np.dot(np.stack([xm, ym]).T - self.center[::-1], np.array([0,1]))/rm)[round(self.center[1]):]
+        theta_bot = np.arccos(np.dot(np.stack([xm, ym]).T - self.center[::-1], np.array([0,-1]))/rm)[:round(self.center[1])]
         thetam = np.vstack([theta_bot, theta_top])
         thetam[np.isnan(thetam)] = 0
         return xm, ym, rm, thetam
@@ -673,26 +683,8 @@ class BDdecomp:
         err_func = smp.lambdify([theta, a, b, pa, n, d_a, d_b, d_pa, d_n], err_expr)
         return err_func(theta_, a_, b_, pa_, n_, d_a_, d_b_, d_pa_, d_n_)
 
-    def get_init_pars(self):
-        r_major = self.iso_data['g'][0]*0.262
-        r_minor = self.iso_data['g'][1]*0.262
-        mags = self.iso_data['g'][11]
-        mag_err = self.iso_data['g'][10]
-        pa = self.iso_stat['pa']
-        max_r = self.image['g'].shape[0]/2
 
-        c1_a = curve_fit(self.bulge, r_major, mags, sigma=mag_err, p0=[20, max_r/3, 2], bounds=[[16, 0.1, 0.1], [25, max_r, 10]])[0]
-        c1_b = curve_fit(self.bulge, r_minor, mags, sigma=mag_err, p0=[20, max_r/3, 2], bounds=[[16, 0.1, 0.1], [25, max_r, 10]])[0]
-        p0_1 = [(c1_a[0]+c1_b[0])/2, (c1_a[0]+c1_b[0])/2-1, (c1_a[2]+c1_b[2])/2, c1_a[1], c1_b[1], pa, 2]
-
-        c2_a = curve_fit(self.combine, r_major, mags, sigma=mag_err, p0=[21, 20, max_r/4, max_r/2, 1], bounds=[[16, 16, 0.5, 1, 0.5], [24, 23, max_r, max_r, 3]])[0]
-        c2_b = curve_fit(self.combine, r_minor, mags, sigma=mag_err,  p0=[21, 20, max_r/4, max_r/2, 1], bounds=[[16, 16, 0.5, 1, 0.5], [24, 23, max_r, max_r, 3]])[0]
-        p0_2 = [(c2_a[0]+c2_b[0])/2, (c2_a[0]+c2_b[0])/2-1, (c2_a[1]+c2_b[1])/2, (c2_a[1]+c2_b[1])/2+1, (c2_a[4]+c2_b[4])/2, 
-                c2_a[2], c2_b[2], pa, 2, c2_a[3], c2_b[3], pa, 2]
-        # p0_2 = [18, 17, 20, 21, 1, 4, 3, pa, 2, 8, 6, pa, 2]
-        return p0_1, p0_2
-    
-    def create_data(self, spokes, plot=False):
+    def create_data(self, spokes, center=False):
         angle_targets = {'g': np.linspace(0, 360-360/spokes, spokes), 'r': np.linspace(180/spokes, 360-180/spokes, spokes)}
         x_data_g = np.concatenate([self.target_angle(self.iso_data['g'].T, np.deg2rad(ang_i)) for ang_i in angle_targets['g']]) * 0.262
         x_err_g = np.concatenate([self.error_prop_SE(ang_i, *[self.iso_data['g'][i] for i in [0,1,2,3,6,7,8,9]]) for ang_i in angle_targets['g']]) * 0.262
@@ -704,13 +696,13 @@ class BDdecomp:
         y_data_r = np.tile(self.iso_data['r'][11], spokes)
         y_err_r = np.tile(self.iso_data['r'][10], spokes)
 
-        if plot:
+        if center: 
             ci = np.round(self.center).astype(int)
-            cmag_g = self.image['g'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
-            cmag_r = self.image['r'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
+            cmag_g = self.image['g'][ci[1]-1:ci[1]+2, ci[0]-1:ci[0]+2]
+            cmag_r = self.image['r'][ci[1]-1:ci[1]+2, ci[0]-1:ci[0]+2]
             x_, x_err = 0.262, 0.262/3
-            y_g, y_g_err = np.min(cmag_g), np.std(cmag_g)
-            y_r, y_r_err = np.min(cmag_r), np.std(cmag_r)
+            y_g, y_g_err = np.mean(cmag_g), np.std(cmag_g)
+            y_r, y_r_err = np.mean(cmag_r), np.std(cmag_r)
             g_len, r_len = len(x_data_g.reshape(spokes, -1)[0]), len(x_data_r.reshape(spokes, -1)[0])
 
             x_data_g = np.insert(x_data_g.reshape(spokes, -1), g_len, x_, axis=1).flatten()
@@ -733,19 +725,15 @@ class BDdecomp:
 
     def fit_functions(self, spokes, psf=True, truncate=True):
         xm, ym, rm, thetam = self.get_meshgrid()
-        std_g = self.gobj['g'].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
-        std_r = self.gobj['r'].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
-        kernal_g = Gaussian2DKernel(x_stddev=std_g, y_stddev=std_g)
-        kernal_r = Gaussian2DKernel(x_stddev=std_r, y_stddev=std_r)
         angle_targets = {'g': np.linspace(0, 360-360/spokes, spokes), 'r': np.linspace(180/spokes, 360-180/spokes, spokes)}
 
         def psf_convolve(model):
             model_grid_g = model(rm*0.262, thetam, 'g')
             model_grid_r = model(rm*0.262, thetam, 'r')
-            model_psf_g = -2.5*np.log10(convolve_fft(10**(-0.4*model_grid_g), kernal_g))
-            model_psf_r = -2.5*np.log10(convolve_fft(10**(-0.4*model_grid_r), kernal_r))
-            interp_g = RegularGridInterpolator((xm[0]*0.262, ym.T[0]*0.262), model_psf_g.T)#, bounds_error=False, fill_value=None
-            interp_r = RegularGridInterpolator((xm[0]*0.262, ym.T[0]*0.262), model_psf_r.T)#, bounds_error=False, fill_value=None
+            model_psf_g = -2.5*np.log10(convolve(10**(-0.4*model_grid_g), self.kernal['g'], mode='same'))
+            model_psf_r = -2.5*np.log10(convolve(10**(-0.4*model_grid_r), self.kernal['r'], mode='same'))
+            interp_g = RegularGridInterpolator((xm[0]*0.262, ym.T[0]*0.262), model_psf_g.T)
+            interp_r = RegularGridInterpolator((xm[0]*0.262, ym.T[0]*0.262), model_psf_r.T)
             return {'g': interp_g, 'r': interp_r}
         
         def model_psf(r, theta, band, psf_interp):
@@ -810,26 +798,29 @@ class BDdecomp:
             def model(x, theta, band):
                 Re_bar = self.super_ellipse(theta, *pars[rp:rp+4])
                 h = self.super_ellipse(theta, *pars[rp+4:rp+8])
-                return self.combine_3(x, ue_bulge[band], ue_bar[band], u0[band], Re_bulge, Re_bar, h, n_bulge, n_bar)
+                if truncate:
+                    return self.fit_combine_3(x, ue_bulge[band], ue_bar[band], u0[band], Re_bulge, Re_bar, h, n_bulge, n_bar)
+                else:
+                    return self.combine_3(x, ue_bulge[band], ue_bar[band], u0[band], Re_bulge, Re_bar, h, n_bulge, n_bar)
             
             return generate_data(model, data)
         
         return bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model
 
 
-    def main_BD(self, spokes=12, mode=0, disk=1, psf=True):
+    def main_BD(self, spokes=12, mode=0, psf=True):
         bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes, psf)
-        m1, m2, m3, m4 = self.fit_functions(spokes, psf=False)
 
-        self.decomp_data = self.create_data(spokes)
+        self.decomp_data = self.create_data(spokes, center=False)
         x_data, y_data, x_err, y_err = self.decomp_data['all']
         data = Data(x_data, y_data, we=1/x_err**2, wd=1/y_err**2)
 
         ci = np.round(self.center).astype(int)
-        cmag_g = self.image['g'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
-        cmag_r = self.image['r'][ci[0]-1:ci[0]+2, ci[1]-1:ci[1]+2]
-        p0_1 = [np.min(cmag_g)+4, np.min(cmag_r)+4, 2, np.mean(self.iso_data['g'][0]*0.262), np.mean(self.iso_data['g'][1]*0.262),  self.iso_stat['pa'], 2]
-        p0_0 = [np.min(cmag_g), np.min(cmag_r),  np.mean(self.iso_data['g'][0]*0.262), np.mean(self.iso_data['g'][1]*0.262), self.iso_stat['pa'], 2]
+        cmag_g = self.image['g'][ci[1]-1:ci[1]+2, ci[0]-1:ci[0]+2]
+        cmag_r = self.image['r'][ci[1]-1:ci[1]+2, ci[0]-1:ci[0]+2]
+        dmu = 2.5*self.get_b(2)/np.log(10)
+        p0_1 = [np.mean(cmag_g)+dmu, np.mean(cmag_r)+dmu, 2, np.mean(self.iso_data['g'][0]*0.262), np.mean(self.iso_data['g'][1]*0.262),  self.iso_stat['pa'], 2]
+        p0_0 = [np.mean(cmag_g), np.mean(cmag_r),  np.mean(self.iso_data['g'][0]*0.262), np.mean(self.iso_data['g'][1]*0.262), self.iso_stat['pa'], 2]
 
         odr_1 = ODR(data, Model(bulge_2D_model), beta0=p0_1, maxit=10)
         odr_1.set_job(fit_type=mode)
@@ -841,32 +832,36 @@ class BDdecomp:
         output_0 = odr_0.run()
         self.decomp[3] = [[*output_0.beta], [*output_0.sd_beta]]
         
-        if output_1.beta[2] > disk:
-            data_i = Data(x_data[len(x_data//2):], y_data[len(x_data//2):], we=1/x_err[len(x_data//2):]**2, wd=1/y_err[len(x_data//2):]**2)
-            odr_0 = ODR(data_i, Model(m4), beta0=p0_0, maxit=10)
-            output_0 = odr_0.run()
-            u0g, u0r, ha, hb, pa_d, c_d = output_0.beta
-            
-            ind_g = np.argmin(np.abs(self.iso_data['g'][11] - (np.mean(cmag_g)+1)))
-            ai, bi, pai, ci, *rest = self.iso_data['g'].T[ind_g]
-            p0_2 =  [np.min(cmag_g)+1, np.min(cmag_r)+1, u0g, u0r, 1, max(abs(ai), abs(bi))*0.262, min(abs(ai), abs(bi))*0.262, pai, ci, max(abs(ha), abs(hb)), min(abs(ha), abs(hb)), pa_d, c_d]
-
-            odr_2 = ODR(data, Model(bulge_disk_2D_model), beta0=p0_2, maxit=10)
-            odr_2.set_job(fit_type=mode)
-            output_2 = odr_2.run()
-            self.decomp[1] = [[*output_2.beta], [*output_2.sd_beta]]
+        u0g, u0r, ha, hb, pa_d, c_d = self.decomp[3][0]
+        dmu = 2.5*self.get_b(1)/np.log(10)
+        ind_g = np.argmin(np.abs(self.iso_data['g'][11] - (np.mean(cmag_g)+dmu)))
+        ai, bi, pai, ci, *rest = self.iso_data['g'].T[ind_g]
+        p0_2 =  [np.mean(cmag_g)+dmu, np.mean(cmag_r)+dmu, u0g, u0r, 1, max(abs(ai), abs(bi))*0.262, min(abs(ai), abs(bi))*0.262, pai, ci, ha, hb, pa_d, c_d]
+        odr_2 = ODR(data, Model(bulge_disk_2D_model), beta0=p0_2, maxit=10)
+        odr_2.set_job(fit_type=mode)
+        output_2 = odr_2.run()
+        self.decomp[1] = [[*output_2.beta], [*output_2.sd_beta]]
 
     
-    def bulge_bar_disk_decomp(self, spokes=12, mode=0, psf=False):
+    def bulge_bar_disk_decomp(self, spokes=12, mode=0, psf=True):
         bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes, psf)  
+        def init_bar(ue_bulge, u0_disk, n_bulge, n_bar):
+            b_bulge = self.get_b(n_bulge)
+            u0_bulge = ue_bulge - 2.5*b_bulge/np.log(10)
+            u0_bar = (u0_bulge + u0_disk)/2
+            b_bar = self.get_b(n_bar)
+            return u0_bar + 2.5*b_bar/np.log(10)
         
         if self.decomp[1][0] != 0:
-            self.decomp_data = self.create_data(spokes)
+            self.decomp_data = self.create_data(spokes, center=False)
             x_data, y_data, x_err, y_err = self.decomp_data['all']
             data = Data(x_data, y_data, we=1/x_err**2, wd=1/y_err**2)
+
             ue_g, ue_r, u0_g, u0_r, n, Re_a, Re_b, Re_pa, Re_n, h_a, h_b, h_pa, h_n = self.decomp[1][0]
-            p0_3 = [ue_g-0.5, ue_r-0.5, ue_g+1, ue_r+1, u0_g, u0_r, n, 0.3, Re_b, Re_a, Re_b, Re_pa, Re_n, h_a, h_b, h_pa, h_n]
-            p0_3= [ue_g+0.1, ue_r+0.1, u0_g-1, u0_r-1, u0_g, u0_r, 1, 0.3, Re_b/2, Re_a*2, Re_b/2, Re_pa+np.pi/3, 3, h_a, h_b, h_pa, h_n]
+            ue_bar_g = init_bar(ue_g, u0_g, n, 0.5)
+            ue_bar_r = init_bar(ue_r, u0_r, n, 0.5)
+            
+            p0_3 = [ue_g, ue_r, ue_bar_g, ue_bar_r, u0_g, u0_r, n, 0.5, Re_b, Re_a, Re_b, Re_pa, 3, h_a, h_b, h_pa, h_n]
             odr_3 = ODR(data, Model(bulge_bar_disk_2D_model), beta0=p0_3, maxit=10)
             odr_3.set_job(fit_type=mode)
             output_3 = odr_3.run()
@@ -922,7 +917,8 @@ class BDdecomp:
                     return [a, 1-b/a, ue_g_4-ue_r_4, h_n_4, h_pa_4%(np.pi)]
 
  
-        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes=12, truncate=False)
+        bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model, disk_2D_model = self.fit_functions(spokes=12, psf=True, truncate=True)
+        self.decomp_data = self.create_data(spokes=12, center=False)
         x_data, y_data, x_err, y_err = self.decomp_data['all']
         if len(x_data) == 0:
             return np.zeros(54)
@@ -979,7 +975,7 @@ class BDdecomp:
         def elliptical_check(labels, ell, col, SE_n, sersic_n):
             col_k = col - np.subtract(*self.kcorr['Ell'])
             condition = (ell < 0.6) and (col_k > 0.5) and (col_k < 2) and (SE_n > 1.8) and (SE_n < 2.2) and (self.decomp[0][0] != 0) 
-            if not condition:
+            if not condition: # se, ecc rework
                 labels.remove('bulge')
             return labels
         
@@ -1055,7 +1051,7 @@ class BDdecomp:
             u0_bulge = bulge_ug - 2.5*b_bulge/np.log(10)
             u0_bar = bar_ug - 2.5*b_bar/np.log(10)
             bulge_condition = (bulge_kcol > 0.5) and (bulge_kcol < 2) and (u0_bulge < u0_bar) and (Re_bulge < Re_bar)
-            bar_condition = (bar_ell > 0.3) and (bar_n < 0.75) and (bar_kcol > d_kcol-0.1) and (bar_kcol < bulge_kcol+0.5) and (bar_SE > 1) and (bar_SE < 5)
+            bar_condition = (bar_ell > 0.3) and (bar_n < 0.75) and (bar_kcol > d_kcol-0.1) and (bar_kcol < bulge_kcol+0.5) and (bar_SE > 1) and (bar_SE < 5) # rework bar color
             disk_condition = (d_ell < 0.55) and (d_kcol > 0) and (d_kcol < 0.8) and (d_SE > 1.5) and (d_SE < 3)
             condition = bulge_condition and bar_condition and disk_condition
             if not condition:
@@ -1080,8 +1076,8 @@ class BDdecomp:
         elif len(galaxy_possible) > 0:
             cond1 = (len(galaxy_rss_cut) == 0)
             cond2 =  (abs(df_g['n_iso_g'].values[0]-df_g['n_iso_r'].values[0]) > 10)
-            cond3 = (self.decomp_data['g'][1].max() < 22)
-            cond4 = (self.decomp_data['r'][1].max() < 22)
+            cond3 = (self.decomp_data['g'][1].max() < 23)
+            cond4 = (self.decomp_data['r'][1].max() < 23)
             if cond1 or cond2 or cond3 or cond4:
                 return 'bad_fit'
             elif len(galaxy_rss_cut) == 1:
@@ -1324,11 +1320,9 @@ class BDdecomp:
         rotation_matrix = np.array([[np.cos(gal_pa), np.sin(gal_pa)], [-np.sin(gal_pa), np.cos(gal_pa)]])
         sn_radial, sn_height = (rotation_matrix @ (sn_deg - host_deg)) * 3600/arcsec2kpc
         
-        dr2_pars = sample.data.loc[self.name][['x1', 'c', 'classification', 'peak_mag_ztfg', 'peak_mag_ztfr', 'lccoverage_flag', 'x1_err', 'c_err']]
-        if np.any(df_gp[df_gp['ztfname'] == self.name]):
-            gp_pars = df_gp[df_gp['ztfname'] == self.name][['abs_mag_peak_g', 'dm_p15_g',  'tr_tg', 'abs_mag_peak_err_g', 'dm_p15_err_g']].values[0]
-        else:
-            gp_pars = np.zeros(5)
+        dr2_pars = df_salt.loc[self.name][['x1', 'c', 'peak_mag_ztfg', 'peak_mag_ztfr', 'lccoverage_flag', 'x1_err', 'c_err', 'frac_fitted', 'lcquality_flag', 'fitprob']]
+        sn_class = df_class.loc[self.name]
+
         if np.any(si_umut[si_umut['ztfname'] == self.name]):
             si_pars = si_umut[si_umut['ztfname'] == self.name][['V_Sil_6355_median', 'FWHMA_Sil_6355_median', 'pEW_Sil_6355_median_trap','V_sil_6355_err_final_high',  'FWHMA_err_high_6355_final', 'pEW_err_trap_high_6355_final',
                                                                  'V_Sil_5972_median', 'FWHMA_Sil_5972_median', 'pEW_Sil_5972_median_trap','V_sil_5972_err_final_high', 'FWHMA_err_high_5972_final', 'pEW_err_trap_high_5972_final',
@@ -1337,8 +1331,7 @@ class BDdecomp:
             si_pars = np.zeros(14)
         
         if self.name in df_mass.index:
-            dr2_host = df_mass.loc[self.name]
-            host_mass, mass_error = dr2_host['mass'], dr2_host['mass_err']
+            host_mass, mass_error = df_mass[['mass', 'mass_err']].loc[self.name]
             smsd = np.log10(10**host_mass/(2*np.pi*gal_Re**2))
             tau = 1.12 * smsd - 8.6
             tau_list = disk_dust['tau'].unique()
@@ -1346,25 +1339,21 @@ class BDdecomp:
         else:
             host_mass, mass_error, smsd, tau = 0, 0, 0, 0
             proj_h, proj_u0, dust_h, dust_u0_g, dust_u0_r = 0, 0, 0, 0, 0
-
+        # psf colour too
         self.galaxy = [self.name, z, z_source, *sn_deg, *host_deg, galaxy_type, sn_component, separation, sn_radial, sn_height, sn_local_g, sn_local_r, sn_local_g_err, sn_local_r_err, 
-                       R25_g, R25_r,R25_sn_g, R25_sn_r, *dr2_pars, *gp_pars, *si_pars, *bulge_pars, *disk_pars, *bar_pars, bulge_disk_ratio, host_mass, mass_error, smsd, tau,
+                       R25_g, R25_r,R25_sn_g, R25_sn_r, *dr2_pars, *sn_class, *si_pars, *bulge_pars, *disk_pars, *bar_pars, bulge_disk_ratio, host_mass, mass_error, smsd, tau,
                        proj_h, proj_u0, dust_h, dust_u0_g, dust_u0_r, gal_Re, gal_ecc, gal_pa, bulge_mag_g, bulge_mag_r, bulge_lum_g, bulge_lum_r, bar_mag_g, bar_mag_r, bar_lum_g, bar_lum_r,
                        disk_mag_g, disk_mag_r, disk_lum_g, disk_lum_r]
                                                       
 
     def plot_func(self, psf):
         xm, ym, rm, thetam = self.get_meshgrid()
-        std_g = self.gobj['g'].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
-        std_r = self.gobj['r'].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
-        kernal_g = Gaussian2DKernel(x_stddev=std_g, y_stddev=std_g)
-        kernal_r = Gaussian2DKernel(x_stddev=std_r, y_stddev=std_r)
 
         def psf_convolve(model):
             model_grid_g = model(rm*0.262, thetam, 'g')
             model_grid_r = model(rm*0.262, thetam, 'r')
-            model_psf_g = -2.5*np.log10(convolve_fft(10**(-0.4*model_grid_g), kernal_g))
-            model_psf_r = -2.5*np.log10(convolve_fft(10**(-0.4*model_grid_r), kernal_r))
+            model_psf_g = -2.5*np.log10(convolve(10**(-0.4*model_grid_g), self.kernal['g'], mode='same'))
+            model_psf_r = -2.5*np.log10(convolve(10**(-0.4*model_grid_r), self.kernal['r'], mode='same'))
             interp_g = RegularGridInterpolator((xm[0]*0.262, ym.T[0]*0.262), model_psf_g.T)
             interp_r = RegularGridInterpolator((xm[0]*0.262, ym.T[0]*0.262), model_psf_r.T)
             return {'g': interp_g, 'r': interp_r}
@@ -1406,7 +1395,7 @@ class BDdecomp:
             def model(x, theta, band):
                 Re = self.super_ellipse(theta, *pars[rp:rp+4])
                 h = self.super_ellipse(theta, *pars[rp+4:rp+8])
-                return self.combine(x, ue[band], u0[band], Re, h, n)
+                return self.fit_combine(x, ue[band], u0[band], Re, h, n)
             return generate_data(model, x_data, theta, band)
 
         def bulge_bar_disk_2D_model(x_data, pars, theta, band):
@@ -1418,16 +1407,17 @@ class BDdecomp:
             def model(x, theta, band):
                 Re_bar = self.super_ellipse(theta, *pars[rp:rp+4])
                 h = self.super_ellipse(theta, *pars[rp+4:rp+8])
-                return self.combine_3(x, ue_bulge[band], ue_bar[band], u0[band], Re_bulge, Re_bar, h, n_bulge, n_bar)
+                return self.fit_combine_3(x, ue_bulge[band], ue_bar[band], u0[band], Re_bulge, Re_bar, h, n_bulge, n_bar)
             return generate_data(model, x_data, theta, band)
 
         return  disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model
 
         
-    def plot_spokes(self, sigma=3, n_model=2, psf=True):
+    def plot_spokes(self, sigma=3, n_model=2, psf=True, center=True):
         spokes=12
         rp = [3, 5, 9, 2][n_model-1]
         disk_2D_model, bulge_2D_model, bulge_disk_2D_model, bulge_bar_disk_2D_model = self.plot_func(psf)  
+        self.decomp_data = self.create_data(spokes, center=center)
         fig, axis = plt.subplots(figsize=(18, 10), ncols=2, nrows=3, dpi=100)
 
         wcs = self.gobj['g'].cutout['wcs']
@@ -1464,8 +1454,10 @@ class BDdecomp:
                 Re_bar = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp:rp+4])
                 h_disk = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp+4:rp+8])
                 ax.plot(x_ax, bulge_bar_disk_2D_model(x_ax, self.decomp[n_model-1][0], np.deg2rad(theta[i]), band), 'r-', label=f'combined_{band}')
-                ax.plot(x_ax, self.bulge(x_ax, ue_bulge, Re_bulge, n_bulge), 'g--', label='bulge')
-                ax.plot(x_ax, self.bulge(x_ax, ue_bar, Re_bar, n_bar), 'g--', label='bar', color='lime')
+                x_bulge = np.linspace(0, self.trunc_bulge*abs(Re_bulge), 100)
+                x_bar = np.linspace(0, self.trunc_bar*abs(Re_bar), 100)
+                ax.plot(x_bulge, self.bulge(x_bulge, ue_bulge, Re_bulge, n_bulge), 'g--', label='bulge')
+                ax.plot(x_bar, self.bulge(x_bar, ue_bar, Re_bar, n_bar), 'g--', label='bar', color='lime')
                 ax.plot(x_ax, self.disk(x_ax, u0_disk, h_disk), 'b--', label='disk')
                 ax.legend()
 
@@ -1481,7 +1473,7 @@ class BDdecomp:
                 Re_bulge = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp:rp+4])
                 h_disk = self.super_ellipse(np.deg2rad(theta[i]), *self.decomp[n_model-1][0][rp+4:rp+8])    
                 ax.plot(x_ax, bulge_disk_2D_model(x_ax, self.decomp[n_model-1][0], np.deg2rad(theta[i]), band), 'r-', label=f'combined_{band}')
-                x_bulge = np.linspace(0, 5*Re_bulge, 100)
+                x_bulge = np.linspace(0, self.trunc_bulge*abs(Re_bulge), 100)
                 ax.plot(x_bulge, self.bulge(x_bulge, ue_bulge, Re_bulge, n_sersic), 'g--', label='bulge')
                 ax.plot(x_ax, self.disk(x_ax, u0_disk, h_disk), 'b--', label='disk')
                 ax.legend()
@@ -1602,17 +1594,20 @@ class BDdecomp:
         a, b, pa, n = out_pars[0]
         return [[max(abs(a), abs(b)), min(abs(a), abs(b)), pa, n], np.sqrt(np.diag(out_pars[1])), np.round(check, 3)] 
 
-    def plot_SB_profile(self, band, isophote=False, n_model=2, corr=False):
+
+    def plot_SB_profile(self, band, isophote=False, n_model=2, corr=False, psf=True):
         xm, ym, rm, thetam = self.get_meshgrid()
 
         bulge_arr = self.SB_profile(rm, thetam, model='bulge', n_model=n_model, band=band,  corr=corr)
         bar_arr = self.SB_profile(rm, thetam, model='bar', n_model=n_model, band=band, corr=corr)
         disk_arr = self.SB_profile(rm, thetam, model='disk', n_model=n_model, band=band, corr=corr)
-        both_arr = self.SB_profile(rm, thetam, model='all', n_model=n_model, band=band, corr=corr)
+        comb_arr = self.SB_profile(rm, thetam, model='all', n_model=n_model, band=band, corr=corr)
 
-        std = self.gobj[band].brick['psfsize']/(2*np.sqrt(2*np.log(2)))
-        kernal = Gaussian2DKernel(x_stddev=std, y_stddev=std)
-        both_arr = -2.5*np.log10(convolve_fft(10**(-0.4*both_arr), kernal))
+        if psf:
+            bulge_arr = -2.5*np.log10(convolve(10**(-0.4*bulge_arr), self.kernal[band], mode='same'))
+            bar_arr = -2.5*np.log10(convolve(10**(-0.4*bar_arr), self.kernal[band], mode='same'))
+            disk_arr = -2.5*np.log10(convolve(10**(-0.4*disk_arr), self.kernal[band], mode='same'))
+            comb_arr = -2.5*np.log10(convolve(10**(-0.4*comb_arr), self.kernal[band], mode='same'))
 
         reds, greens, blues = self.alpha_colormap()
 
@@ -1638,7 +1633,7 @@ class BDdecomp:
         
         ax2.scatter(sn_px[0], sn_px[1], c='cyan', s=40, lw=2, ec='cyan', zorder=10, marker='x', label='SNe Ia')
 
-        ax3.imshow(sub_mag(sky_mag, both_arr), origin='lower', cmap='gray', vmax=30, vmin=mag_c)
+        ax3.imshow(sub_mag(sky_mag, comb_arr), origin='lower', cmap='gray', vmax=30, vmin=mag_c)
         plt.tight_layout()
 
 
@@ -1646,7 +1641,7 @@ class BDdecomp:
         arcsec2px = np.array([0.262, 0.262, 1, 1])
         if n_model == 3:
             Re_bulge = self.decomp[n_model-1][0][8]/0.262
-            self.patch_super_ellipse([Re_bulge, Re_bulge, 0, 2], self.center, ax2, 'red', label='Bulge $R_e$')
+            self.patch_super_ellipse([Re_bulge, Re_bulge, 0, 2], self.center, ax2, 'darkred', label='Bulge $R_e$')
             self.patch_super_ellipse(self.decomp[n_model-1][0][rp:rp+4]/arcsec2px, self.center, ax2, 'green', label='Bar $R_e$')
 
             disk_a, disk_b, disk_pa, disk_n = self.decomp[n_model-1][0][rp+4:rp+8]
@@ -1656,7 +1651,7 @@ class BDdecomp:
             self.patch_super_ellipse(np.array([disk_a, disk_b, disk_pa, disk_n])/arcsec2px, self.center, ax2, 'blue', label='Disk $R_e$')
 
         elif n_model == 2:
-            self.patch_super_ellipse(self.decomp[n_model-1][0][rp:rp+4]/arcsec2px, self.center, ax2, 'red', label='Bulge $R_e$')
+            self.patch_super_ellipse(self.decomp[n_model-1][0][rp:rp+4]/arcsec2px, self.center, ax2, 'darkred', label='Bulge $R_e$')
             u0_g, u0_r = self.decomp[n_model-1][0][2:rp-1]
             u0_disk = {'g': u0_g, 'r': u0_r}[band]
             disk_a, disk_b, disk_pa, disk_n = self.decomp[n_model-1][0][rp+4:rp+8]
@@ -1664,7 +1659,7 @@ class BDdecomp:
             self.patch_super_ellipse(np.array([disk_a, disk_b, disk_pa, disk_n])/arcsec2px, self.center, ax2, 'blue', label='Disk $R_e$')
 
         elif n_model == 1:
-            self.patch_super_ellipse(self.decomp[n_model-1][0][rp:rp+4]/arcsec2px, self.center, ax2, 'red', label='Bulge $R_e$')
+            self.patch_super_ellipse(self.decomp[n_model-1][0][rp:rp+4]/arcsec2px, self.center, ax2, 'darkred', label='Bulge $R_e$')
         
         elif n_model == 0:
             disk_a, disk_b, disk_pa, disk_n = self.decomp[n_model-1][0][rp:rp+4]
